@@ -1,0 +1,1845 @@
+---
+title: "Untitled"
+output: html_document
+date: "2026-08-23"
+---
+
+# Figure 1
+
+```{r}
+library(dplyr)
+library(purrr)
+library(ggplot2)
+library(tibble)
+
+COMMON_EXCLUDE_STATES <- c("IA", "MN", "MO", "OK")
+
+df_epi <- final_data %>%
+  dplyr::transmute(
+    state = as.character(state),
+    date = as.Date(date),
+    hosp = as.numeric(Hospital.Admissions)
+  ) %>%
+  dplyr::filter(!state %in% COMMON_EXCLUDE_STATES) %>%
+  dplyr::group_by(date) %>%
+  dplyr::summarise(
+    median_hosp = median(hosp, na.rm = TRUE),
+    n_states = dplyr::n_distinct(state),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(date)
+
+stopifnot(
+  nrow(df_epi) == 70,
+  all(df_epi$n_states == 46),
+  all(is.finite(df_epi$median_hosp))
+)
+
+study_dates <- df_epi$date
+x_min <- study_dates[1]
+x_max <- study_dates[70]
+
+# Five folds: 20-week training, 10-week evaluation.
+fold_y <- tibble::tibble(fold = 1:5, y_mid = c(5.4, 4.3, 3.2, 2.1, 1.0))
+bar_half_height <- 0.48
+
+fold_overlay <- purrr::map_dfr(1:5, function(i) {
+
+  train_start_i <- 1 + (i - 1) * 10
+  train_end_i   <- train_start_i + 19
+  eval_end_i    <- train_end_i + 10
+
+  boundary <- study_dates[train_end_i] + 3.5
+
+  tibble::tibble(
+    fold = i,
+    period = c("Training", "Evaluation"),
+    xmin = c(study_dates[train_start_i], boundary),
+    xmax = c(boundary, study_dates[eval_end_i])
+  )
+}) %>%
+  dplyr::left_join(fold_y, by = "fold") %>%
+  dplyr::mutate(
+    ymin = y_mid - bar_half_height,
+    ymax = y_mid + bar_half_height
+  )
+
+stopifnot(nrow(fold_overlay) == 10, all(is.finite(fold_overlay$y_mid)))
+
+fold_labels <- fold_overlay %>%
+  dplyr::filter(period == "Training") %>%
+  dplyr::transmute(fold, x = xmin + 7, y = y_mid, label = paste0("Fold ", fold))
+
+p_fig1_overlay <- ggplot() +
+  geom_area(
+    data = df_epi,
+    aes(x = date, y = median_hosp),
+    fill = "grey80", color = NA
+  ) +
+  geom_rect(
+    data = fold_overlay,
+    aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = period),
+    alpha = 0.50, color = NA
+  ) +
+  geom_line(
+    data = df_epi,
+    aes(x = date, y = median_hosp),
+    color = "black", linewidth = 0.65
+  ) +
+  geom_text(
+    data = fold_labels,
+    aes(x = x, y = y, label = label),
+    hjust = 0, vjust = 0.5, size = 4.7
+  ) +
+  scale_fill_manual(
+    values = c("Training" = "#F2C94C", "Evaluation" = "#8FBC78"),
+    breaks = c("Training", "Evaluation")
+  ) +
+  scale_x_date(
+    limits = c(x_min, x_max),
+    date_breaks = "2 months",
+    date_labels = "%b\n%Y",
+    expand = c(0, 0)
+  ) +
+  scale_y_continuous(
+    limits = c(0, 6.2),
+    breaks = c(0, 2, 4, 6),
+    expand = c(0, 0)
+  ) +
+  labs(x = NULL, y = "Median observed admissions", fill = NULL) +
+  guides(
+    fill = guide_legend(
+      keywidth = grid::unit(1.2, "cm"),
+      keyheight = grid::unit(0.50, "cm"),
+      override.aes = list(alpha = 0.50)
+    )
+  ) +
+  theme_classic(base_size = 16) +
+  theme(
+    legend.position = "top",
+    legend.direction = "horizontal",
+    legend.title = element_blank(),
+    legend.text = element_text(size = 14),
+    legend.key.width = grid::unit(1.2, "cm"),
+    legend.key.height = grid::unit(0.50, "cm"),
+    axis.title.y = element_text(size = 16, margin = margin(r = 10)),
+    axis.text.x = element_text(size = 13, color = "black"),
+    axis.text.y = element_text(size = 13, color = "black"),
+    axis.line = element_line(linewidth = 0.7),
+    axis.ticks = element_line(linewidth = 0.6),
+    plot.margin = margin(10, 14, 10, 10)
+  )
+
+print(p_fig1_overlay)
+
+ggsave(
+  "Fig1_epidemic_CV_overlay_final.png",
+  p_fig1_overlay,
+  width = 12, height = 6.8, dpi = 300, bg = "white"
+)
+```
+
+
+# Figure 2
+
+```{r}
+trunc3 <- function(x) trunc(x * 1000) / 1000
+
+prepare_bars <- function(tbl) {
+  tbl %>%
+    dplyr::filter(k %in% 1:11) %>%
+    dplyr::arrange(k) %>%
+    dplyr::transmute(
+      x = factor(k, levels = 1:11),
+      y_full = median_state_rmse_46,
+      y = trunc3(median_state_rmse_46)
+    )
+}
+
+df1 <- prepare_bars(best_state_median_with_hosp_46_by_k)
+df2 <- prepare_bars(best_state_median_no_hosp_46_by_k)
+
+df_pct <- data.frame(
+  x = df1$x,
+  pct = round((df2$y_full - df1$y_full) / df2$y_full * 100, 1),
+  mid_y = (df1$y + df2$y) / 2
+)
+
+y_max <- max(c(df1$y, df2$y)) + 0.3
+
+square_size  <- 0.12
+square_width <- 0.37
+legend_x <- 0.7
+legend_y <- y_max + 0.1
+
+graph <- ggplot() +
+  geom_col(data = df2, aes(x = x, y = y), fill = "steelblue", alpha = 0.3) +
+  geom_col(data = df1, aes(x = x, y = y), fill = "steelblue", alpha = 0.75) +
+  geom_text(
+    data = df_pct,
+    aes(x = x, y = mid_y, label = paste0(pct, "%")),
+    color = "black", size = 3.3
+  ) +
+  annotate(
+    "rect",
+    xmin = legend_x, xmax = legend_x + square_width,
+    ymin = legend_y, ymax = legend_y - square_size,
+    fill = "steelblue", alpha = 0.3
+  ) +
+  annotate(
+    "text",
+    x = legend_x + square_width + 0.10,
+    y = legend_y - square_size / 2,
+    label = "Excluding hospital admissions",
+    hjust = 0, size = 3.7
+  ) +
+  annotate(
+    "rect",
+    xmin = legend_x, xmax = legend_x + square_width,
+    ymin = legend_y - square_size - 0.04,
+    ymax = legend_y - 2 * square_size - 0.04,
+    fill = "steelblue", alpha = 0.75
+  ) +
+  annotate(
+    "text",
+    x = legend_x + square_width + 0.10,
+    y = legend_y - square_size * 1.5 - 0.04,
+    label = "Including hospital admissions",
+    hjust = 0, size = 3.7
+  ) +
+  labs(x = "Number of covariates", y = "RMSE") +
+  coord_cartesian(ylim = c(0, y_max), clip = "off") +
+  theme(
+    text = element_text(size = 14),
+    panel.background = element_rect(fill = "white"),
+    plot.background = element_rect(fill = "white"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.line = element_line(color = "black"),
+    axis.ticks = element_line(color = "black"),
+    plot.margin = margin(10, 30, 10, 10)
+  )
+
+graph
+
+ggsave("Fig2_rmse_by_model_size.png", graph,
+       width = 6.5, height = 4, dpi = 300)
+```
+
+
+# Figure 3
+
+```{r}
+source_list <- c(
+  "Wearing Masks", "Symptoms", "Symptoms in Community", "Outpatient Visits",
+  "Test Positivity", "Cases", "Deaths", "Vaccinations",
+  "Policy Index", "Climate", "Hospital Admissions", "ED Visits"
+)
+
+parse_predictor_numbers <- function(x) as.integer(strsplit(x, ",\\s*")[[1]])
+
+trunc3 <- function(x) trunc(x * 1000) / 1000
+
+# Univariate models, sorted by RMSE. 
+res_k1 <- all_state_median_results %>%
+  dplyr::filter(k == 1) %>%
+  dplyr::mutate(
+    predictor_idx = as.integer(predictor_numbers),
+    Source = source_list[predictor_idx]
+  ) %>%
+  dplyr::arrange(median_state_rmse_46)
+
+df_ind <- data.frame(
+  Source = factor(res_k1$Source, levels = rev(res_k1$Source)),
+  Value = res_k1$median_state_rmse_46,
+  type = "univariate"
+)
+
+source_levels <- levels(df_ind$Source)
+
+# Bivariate models pairing each predictor with hospital admissions,
+# ordered to match the univariate panel
+res_k2 <- all_state_median_results %>%
+  dplyr::filter(k == 2) %>%
+  dplyr::mutate(predictor_idx_list = purrr::map(predictor_numbers, parse_predictor_numbers)) %>%
+  dplyr::filter(purrr::map_lgl(predictor_idx_list, ~ 11L %in% .x)) %>%
+  dplyr::mutate(
+    other_idx = purrr::map_int(predictor_idx_list, ~ .x[.x != 11L]),
+    other_name = source_list[other_idx]
+  ) %>%
+  dplyr::slice(match(setdiff(res_k1$Source, "Hospital Admissions"), other_name))
+
+df_pred <- data.frame(
+  Source = factor(res_k2$other_name, levels = source_levels),
+  Value = res_k2$median_state_rmse_46,
+  type = "combined"
+)
+
+df_comb <- dplyr::bind_rows(df_ind, df_pred)
+
+df_seg <- df_pred %>%
+  dplyr::left_join(df_ind %>% dplyr::select(Source, Value_orig = Value), by = "Source")
+
+stopifnot(
+  nrow(res_k1) == 12, nrow(res_k2) == 11,
+  nrow(df_ind) == 12, nrow(df_pred) == 11, nrow(df_seg) == 11,
+  all(is.finite(df_comb$Value)),
+  all(is.finite(df_seg$Value_orig))
+)
+```
+
+```{r}
+compute_state_median_46 <- function(lag_suffix) {
+
+  purrr::map_dfr(1:12, function(k) {
+
+    object_name <- paste0("comb", k, "_median_vac.", lag_suffix)
+    if (!exists(object_name, envir = .GlobalEnv)) {
+      stop("Object not found: ", object_name)
+    }
+
+    pred_list  <- get(object_name, envir = .GlobalEnv)$y_predicted_new
+    combo_list <- combn(1:12, k, simplify = FALSE)
+
+    purrr::imap_dfr(pred_list, function(pred_tibble, combo_index) {
+
+      pred_common_46 <- pred_tibble %>%
+        dplyr::mutate(state = as.character(state)) %>%
+        dplyr::filter(!state %in% COMMON_EXCLUDE_STATES)
+
+      n_common_states <- dplyr::n_distinct(pred_common_46$state)
+      if (n_common_states != 46) {
+        stop("lag=", lag_suffix, ", k=", k, ", combo_index=", combo_index,
+             ": ", n_common_states, " states")
+      }
+
+      state_rmse_46 <- pred_common_46 %>%
+        dplyr::group_by(state) %>%
+        dplyr::summarise(rmse = sqrt(mean((pred - obs)^2)), .groups = "drop")
+
+      tibble::tibble(
+        k = k,
+        combo_index = combo_index,
+        predictor_numbers = paste(combo_list[[combo_index]], collapse = ", "),
+        median_state_rmse_46 = median(state_rmse_46$rmse)
+      )
+    })
+  })
+}
+
+best_of_each_size <- function(tbl) {
+  tbl %>%
+    dplyr::arrange(k, median_state_rmse_46, combo_index) %>%
+    dplyr::group_by(k) %>%
+    dplyr::slice(1) %>%
+    dplyr::ungroup()
+}
+
+best_lag1_46_by_k <- best_of_each_size(compute_state_median_46("lag1"))
+best_lag2_46_by_k <- best_of_each_size(compute_state_median_46("lag2"))
+best_lag3_46_by_k <- best_of_each_size(all_state_median_results)
+
+selected_sources <- best_lag3_46_by_k %>%
+  dplyr::arrange(k) %>%
+  dplyr::mutate(predictor_idx_list = purrr::map(predictor_numbers, parse_predictor_numbers)) %>%
+  dplyr::pull(predictor_idx_list) %>%
+  lapply(function(idx) source_list[idx]) %>%
+  setNames(paste0("comb", 1:12))
+
+df_selected <- expand.grid(Source = source_levels, Combination = paste0("comb", 1:12))
+df_selected$Selected <- 0
+
+for (comb in paste0("comb", 1:12)) {
+  df_selected$Selected[
+    df_selected$Combination == comb & df_selected$Source %in% selected_sources[[comb]]
+  ] <- 1
+}
+
+df_selected$Combination <- factor(
+  gsub("comb", "", df_selected$Combination),
+  levels = as.character(1:12)
+)
+df_selected$Source <- factor(df_selected$Source, levels = source_levels)
+
+# ymin = 1 week, yline = 2 weeks, ymax = 3 weeks
+strip_data <- data.frame(
+  Combination = factor(1:12),
+  ymin  = trunc3(best_lag1_46_by_k$median_state_rmse_46),
+  yline = trunc3(best_lag2_46_by_k$median_state_rmse_46),
+  ymax  = trunc3(best_lag3_46_by_k$median_state_rmse_46)
+)
+```
+
+```{r}
+FIG3_STRIP_LIMITS <- c(0.3, 1.4)
+
+plot_rmse <- ggplot() +
+  geom_segment(
+    data = df_seg,
+    aes(x = Value_orig, xend = Value, y = Source, yend = Source),
+    colour = "black", linewidth = 0.5
+  ) +
+  geom_point(
+    data = df_comb,
+    aes(x = Value, y = Source, shape = type, fill = type),
+    colour = "black", stroke = 0.8, size = 1.2
+  ) +
+  scale_x_continuous(
+    breaks = seq(1.0, 3.0, by = 0.5),
+    minor_breaks = seq(1.0, 3.0, by = 0.25),
+    limits = c(0.9, 2.9),
+    expand = expansion(mult = 0)
+  ) +
+  scale_shape_manual("", values = c("univariate" = 21, "combined" = 21)) +
+  scale_fill_manual("", values = c("univariate" = "white", "combined" = "black")) +
+  labs(x = "RMSE", y = NULL) +
+  coord_cartesian(clip = "off") +
+  theme_minimal(base_size = 9) +
+  theme(
+    text = element_text(color = "black"),
+    axis.text = element_text(color = "black"),
+    axis.title = element_text(color = "black"),
+    axis.text.x = element_text(size = 8),
+    axis.text.y = element_text(size = 8.5),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.y = element_blank(),
+    legend.position = "none",
+    plot.margin = margin(t = 5, r = 20, b = 5, l = 5)
+  )
+
+plot_heatmap <- ggplot(
+  df_selected,
+  aes(x = as.numeric(Combination), y = Source, fill = factor(Selected))
+) +
+  geom_tile(color = "grey80", alpha = 0.8, width = 1, height = 1) +
+  scale_x_continuous(breaks = 1:12, labels = 1:12, expand = expansion(add = 0)) +
+  scale_fill_manual(
+    values = c("0" = "white", "1" = "steelblue"),
+    labels = c("0" = "excluded", "1" = "included"),
+    name = NULL
+  ) +
+  labs(x = "Number of predictors included", y = NULL) +
+  theme_minimal(base_size = 10) +
+  theme(
+    text = element_text(color = "black"),
+    axis.text = element_text(color = "black"),
+    axis.title = element_text(color = "black"),
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    legend.position = "none",
+    panel.grid.major.x = element_line(color = "grey90")
+  )
+
+strip_segment <- function(y_var, width) {
+  geom_segment(
+    aes(
+      x = as.numeric(Combination) - 0.5,
+      xend = as.numeric(Combination) + 0.5,
+      y = .data[[y_var]], yend = .data[[y_var]]
+    ),
+    color = "black", linewidth = width
+  )
+}
+
+strip_plot <- ggplot(strip_data) +
+  geom_segment(
+    aes(x = as.numeric(Combination) - 0.5, xend = as.numeric(Combination) - 0.5,
+        y = ymin, yend = ymax),
+    color = "grey60", linewidth = 0.3
+  ) +
+  geom_segment(
+    aes(x = as.numeric(Combination) + 0.5, xend = as.numeric(Combination) + 0.5,
+        y = ymin, yend = ymax),
+    color = "grey60", linewidth = 0.3
+  ) +
+  strip_segment("ymin",  0.5) +
+  strip_segment("yline", 0.9) +
+  strip_segment("ymax",  1.5) +
+  scale_x_continuous(breaks = 1:12, labels = 1:12, expand = expansion(add = 0)) +
+  scale_y_continuous(breaks = seq(0.4, 1.4, by = 0.2), limits = FIG3_STRIP_LIMITS) +
+  labs(y = "RMSE") +
+  theme_minimal(base_size = 9) +
+  theme(
+    text = element_text(color = "black"),
+    axis.text = element_text(color = "black", size = 7),
+    axis.title = element_text(color = "black", size = 8),
+    axis.title.x = element_blank(),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    panel.grid.major.y = element_line(color = "grey90")
+  )
+
+empty_strip <- ggplot() +
+  theme_void() +
+  coord_cartesian(ylim = FIG3_STRIP_LIMITS)
+
+final_plot <-
+  ((empty_strip / plot_rmse)   + plot_layout(heights = c(1, 5)) |
+   (strip_plot  / plot_heatmap) + plot_layout(heights = c(1, 5))) +
+  plot_layout(widths = c(1.3, 3)) &
+  theme(
+    plot.margin = margin(t = 5, r = 0, b = 0, l = 0),
+    panel.spacing = unit(0, "pt")
+  )
+
+legend_df <- data.frame(
+  x = 1,
+  y = 7:1,
+  type = factor(
+    c("included", "excluded", "univariate", "combined",
+      "1 week", "2 weeks", "3 weeks"),
+    levels = c("included", "excluded", "univariate", "combined",
+               "1 week", "2 weeks", "3 weeks")
+  )
+)
+
+legend_plot <- ggplot() +
+  geom_tile(
+    data = subset(legend_df, type %in% c("included", "excluded")),
+    aes(x = x, y = y, fill = type),
+    width = 0.4, height = 0.25, color = "grey50", alpha = 0.8
+  ) +
+  geom_point(
+    data = subset(legend_df, type %in% c("univariate", "combined")),
+    aes(x = x, y = y, shape = type),
+    size = 1.8, color = "black", stroke = 0.6,
+    fill = c("white", "black")
+  ) +
+  geom_segment(
+    data = subset(legend_df, type %in% c("1 week", "2 weeks", "3 weeks")),
+    aes(x = x - 0.3, xend = x + 0.3, y = y, yend = y,
+        linetype = type, linewidth = type),
+    color = "black"
+  ) +
+  scale_fill_manual(
+    name = NULL,
+    values = c("included" = "steelblue", "excluded" = "white"),
+    breaks = c("included", "excluded"),
+    guide = guide_legend(order = 2)
+  ) +
+  scale_shape_manual(
+    name = NULL,
+    values = c("univariate" = 21, "combined" = 21),
+    guide = guide_legend(
+      order = 1,
+      override.aes = list(size = 2, stroke = 0.7, fill = c("white", "black"))
+    )
+  ) +
+  scale_linetype_manual(
+    name = NULL,
+    values = c("1 week" = "solid", "2 weeks" = "solid", "3 weeks" = "solid"),
+    guide = guide_legend(order = 3)
+  ) +
+  scale_linewidth_manual(
+    name = NULL,
+    values = c("1 week" = 0.5, "2 weeks" = 0.9, "3 weeks" = 1.5),
+    guide = guide_legend(order = 3)
+  ) +
+  theme_void() +
+  theme(
+    legend.position = "right",
+    legend.text = element_text(size = 8, colour = "black"),
+    legend.background = element_rect(fill = "white", color = NA),
+    plot.background = element_rect(fill = "white", color = NA)
+  )
+
+final_plot_with_legend <- cowplot::plot_grid(
+  final_plot,
+  cowplot::get_legend(legend_plot),
+  rel_widths = c(1, 0.23),
+  nrow = 1
+)
+
+final_plot_with_legend
+
+ggsave(
+  "Fig3_predictor_selection_46states.png",
+  final_plot_with_legend,
+  width = 6.5, height = 4, dpi = 300, bg = "white"
+)
+```
+
+
+# Figure 4
+
+```{r}
+short_months <- function(p) {
+  p + scale_x_date(date_breaks = "3 months", date_labels = "%b")
+}
+
+upright_x_top <- theme(
+  axis.text.x = element_text(angle = 0, hjust = 0.5, vjust = 1, size = 6),
+  plot.margin = margin(t = 5, r = 5, b = 0, l = 5)
+)
+
+upright_x_bottom <- theme(
+  axis.text.x = element_text(angle = 0, hjust = 0.5, vjust = 1, size = 6),
+  plot.margin = margin(t = 0, r = 5, b = 5, l = 5)
+)
+
+remove_y_axis <- function(p) {
+  p + theme(
+    axis.title.y = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    axis.line.y = element_blank()
+  )
+}
+
+top_with_state <- function(p, state_name, keep_y = FALSE) {
+  p <- p +
+    labs(x = state_name) +
+    theme(axis.title.x = element_text(face = "bold"), legend.position = "none") +
+    upright_x_top
+
+  if (!keep_y) p <- remove_y_axis(p)
+  p
+}
+
+plot_with_and_without_hosp_new <- function(
+    state_name, pred_with, pred_without,
+    ylim_range = c(0, 12),
+    col_without = "darkgreen", col_with = "steelblue"
+) {
+
+  clean_theme <- theme(
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.background = element_rect(fill = "white", color = NA),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.line = element_line(color = "black"),
+    axis.ticks = element_line(color = "black")
+  )
+
+  data_with <- pred_with %>%
+    dplyr::filter(state == state_name) %>%
+    dplyr::arrange(date) %>%
+    dplyr::mutate(model = "With hospital admissions")
+
+  data_without <- pred_without %>%
+    dplyr::filter(state == state_name) %>%
+    dplyr::arrange(date) %>%
+    dplyr::mutate(model = "Without hospital admissions")
+
+  stopifnot(
+    nrow(data_with) == 50,
+    nrow(data_without) == 50,
+    identical(data_with$date, data_without$date),
+    isTRUE(all.equal(data_with$obs, data_without$obs, tolerance = 0)),
+    all(is.finite(data_with$pred)),
+    all(is.finite(data_without$pred))
+  )
+
+  make_graph <- function(data, xlab_text = "") {
+    ggplot(data, aes(x = date)) +
+      geom_point(aes(y = obs), color = "black", size = 1) +
+      geom_line(aes(y = pred, color = model), linewidth = 0.8) +
+      coord_cartesian(ylim = ylim_range) +
+      labs(x = xlab_text, y = "Hospital admissions", color = NULL) +
+      scale_color_manual(values = c(
+        "Without hospital admissions" = col_without,
+        "With hospital admissions" = col_with
+      )) +
+      theme(axis.text.x = element_text(size = 7)) +
+      clean_theme
+  }
+
+  list(
+    without = make_graph(data_without, xlab_text = "Without hospital admissions"),
+    with = make_graph(data_with, xlab_text = "With hospital admissions")
+  )
+}
+```
+
+```{r}
+best_overall <- function(has_hosp) {
+  all_state_median_results %>%
+    dplyr::filter(has_hospitalization == has_hosp) %>%
+    dplyr::arrange(median_state_rmse_46, k, combo_index) %>%
+    dplyr::slice(1)
+}
+
+best_with_hosp_46_overall    <- best_overall(TRUE)
+best_without_hosp_46_overall <- best_overall(FALSE)
+
+k_with      <- best_with_hosp_46_overall$k
+idx_with    <- best_with_hosp_46_overall$combo_index
+k_without   <- best_without_hosp_46_overall$k
+idx_without <- best_without_hosp_46_overall$combo_index
+
+stopifnot(
+  k_with == 6, idx_with == 105,
+  k_without == 4, idx_without == 103
+)
+
+get_prediction_46 <- function(k, combo_index) {
+
+  object_name <- paste0("comb", k, "_median_vac.lag3")
+  if (!exists(object_name, envir = .GlobalEnv)) {
+    stop("Object not found: ", object_name)
+  }
+
+  get(object_name, envir = .GlobalEnv)$y_predicted_new[[combo_index]] %>%
+    dplyr::transmute(
+      state = as.character(state),
+      date = as.Date(date),
+      obs,
+      pred
+    ) %>%
+    dplyr::filter(!state %in% COMMON_EXCLUDE_STATES)
+}
+
+pred_with_final_46    <- get_prediction_46(k_with, idx_with)
+pred_without_final_46 <- get_prediction_46(k_without, idx_without)
+
+prediction_alignment_check <- pred_with_final_46 %>%
+  dplyr::transmute(state, date, obs_with = obs, pred_with = pred) %>%
+  dplyr::inner_join(
+    pred_without_final_46 %>%
+      dplyr::transmute(state, date, obs_without = obs, pred_without = pred),
+    by = c("state", "date")
+  )
+
+prediction_count_check <- prediction_alignment_check %>%
+  dplyr::count(state, name = "n_predictions")
+
+stopifnot(
+  nrow(prediction_alignment_check) == 2300,
+  dplyr::n_distinct(prediction_alignment_check$state) == 46,
+  nrow(prediction_count_check) == 46,
+  all(prediction_count_check$n_predictions == 50),
+  isTRUE(all.equal(
+    prediction_alignment_check$obs_with,
+    prediction_alignment_check$obs_without,
+    tolerance = 0
+  )),
+  all(is.finite(prediction_alignment_check$obs_with)),
+  all(is.finite(prediction_alignment_check$pred_with)),
+  all(is.finite(prediction_alignment_check$pred_without))
+)
+```
+
+```{r}
+selected_states_final <- c("GA", "ID", "IL", "ME")
+state_labels <- c(GA = "Georgia", ID = "Idaho", IL = "Illinois", ME = "Maine")
+ylim_range_final <- c(0, 12)
+
+stopifnot(all(selected_states_final %in% prediction_alignment_check$state))
+
+panels <- lapply(selected_states_final, function(s) {
+  plot_with_and_without_hosp_new(
+    s, pred_with_final_46, pred_without_final_46,
+    ylim_range = ylim_range_final
+  )
+})
+names(panels) <- selected_states_final
+
+top_row_panels <- lapply(selected_states_final, function(s) {
+
+  first <- s == selected_states_final[1]
+  p <- short_months(panels[[s]]$without)
+  if (first) p <- p + labs(y = "Hospital admissions")
+
+  top_with_state(p, state_name = state_labels[[s]], keep_y = first)
+})
+
+bottom_row_panels <- lapply(selected_states_final, function(s) {
+
+  p <- short_months(panels[[s]]$with) +
+    labs(x = NULL) +
+    theme(axis.title.x = element_blank(), legend.position = "none") +
+    upright_x_bottom
+
+  if (s == selected_states_final[1]) {
+    p + labs(y = "Hospital admissions")
+  } else {
+    remove_y_axis(p)
+  }
+})
+
+combined_plot_final <- cowplot::plot_grid(
+  cowplot::ggdraw(patchwork::wrap_plots(top_row_panels, nrow = 1)),
+  cowplot::ggdraw(patchwork::wrap_plots(bottom_row_panels, nrow = 1)),
+  ncol = 1,
+  rel_heights = c(1, 1),
+  align = "v",
+  axis = "lr"
+)
+```
+
+```{r}
+legend_df <- data.frame(
+  model = factor(
+    c("Without hospital admissions", "With hospital admissions"),
+    levels = c("Without hospital admissions", "With hospital admissions")
+  ),
+  x = c(1, 1), xend = c(2, 2), y = c(1, 1), yend = c(1, 1)
+)
+
+legend_plot <- ggplot(legend_df) +
+  geom_segment(
+    aes(x = x, xend = xend, y = y, yend = yend, color = model),
+    linewidth = 1.2, show.legend = TRUE
+  ) +
+  scale_color_manual(
+    values = c(
+      "Without hospital admissions" = "darkgreen",
+      "With hospital admissions" = "steelblue"
+    ),
+    guide = guide_legend(override.aes = list(linewidth = 1.2))
+  ) +
+  theme_classic() +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    axis.line = element_blank(),
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    axis.title = element_blank(),
+    plot.margin = margin(0, 0, 0, 0)
+  )
+
+g <- ggplotGrob(legend_plot)
+guide_idx <- which(vapply(g$grobs, function(x) identical(x$name, "guide-box"), logical(1)))
+
+if (length(guide_idx) != 1) {
+  stop("Legend guide-box extraction failed.")
+}
+
+legend_only <- cowplot::ggdraw() + cowplot::draw_grob(g$grobs[[guide_idx]])
+
+final_plot_fig4 <- cowplot::plot_grid(
+  combined_plot_final,
+  legend_only,
+  ncol = 1,
+  rel_heights = c(1, 0.12)
+)
+
+print(final_plot_fig4)
+
+ggsave(
+  "Fig4_GA_ID_IL_ME_final_k6vs4_46states.png",
+  final_plot_fig4,
+  width = 6, height = 4.5, dpi = 300
+)
+```
+
+
+# Figure 5
+
+```{r}
+best_overall <- function(has_hosp) {
+  all_state_median_results %>%
+    dplyr::filter(has_hospitalization == has_hosp) %>%
+    dplyr::arrange(median_state_rmse_46, k, combo_index) %>%
+    dplyr::slice(1)
+}
+
+best_with_hosp_46_overall    <- best_overall(TRUE)
+best_without_hosp_46_overall <- best_overall(FALSE)
+
+get_prediction_46 <- function(k, combo_index) {
+
+  object_name <- paste0("comb", k, "_median_vac.lag3")
+  if (!exists(object_name, envir = .GlobalEnv)) {
+    stop("Object not found: ", object_name)
+  }
+
+  get(object_name, envir = .GlobalEnv)$y_predicted_new[[combo_index]] %>%
+    dplyr::transmute(
+      state = as.character(state),
+      date = as.Date(date),
+      obs,
+      pred
+    ) %>%
+    dplyr::filter(!state %in% COMMON_EXCLUDE_STATES)
+}
+
+pred_with_final_46 <- get_prediction_46(
+  best_with_hosp_46_overall$k,
+  best_with_hosp_46_overall$combo_index
+)
+
+pred_without_final_46 <- get_prediction_46(
+  best_without_hosp_46_overall$k,
+  best_without_hosp_46_overall$combo_index
+)
+
+pred_compare_46 <- pred_with_final_46 %>%
+  dplyr::rename(pred_with = pred) %>%
+  dplyr::inner_join(
+    pred_without_final_46 %>% dplyr::select(state, date, pred_without = pred),
+    by = c("state", "date")
+  )
+
+prediction_count_check <- pred_compare_46 %>%
+  dplyr::count(state, name = "n_predictions")
+
+stopifnot(
+  dplyr::n_distinct(pred_compare_46$state) == 46,
+  nrow(pred_compare_46) == 2300,
+  nrow(prediction_count_check) == 46,
+  all(prediction_count_check$n_predictions == 50),
+  all(is.finite(pred_compare_46$obs)),
+  all(is.finite(pred_compare_46$pred_with)),
+  all(is.finite(pred_compare_46$pred_without))
+)
+
+PERIOD_DEFS <- data.frame(
+  label = c("Surge 1", "Surge 2", "Later period"),
+  start = as.Date(c("2021-07-25", "2021-12-05", "2022-05-01")),
+  end   = as.Date(c("2021-09-12", "2022-01-23", "2022-06-05")),
+  stringsAsFactors = FALSE
+)
+
+window_lines <- data.frame(start = as.Date(c(PERIOD_DEFS$start, PERIOD_DEFS$end)))
+
+surge_ranges <- PERIOD_DEFS %>%
+  dplyr::filter(label != "Later period") %>%
+  dplyr::mutate(midpoint = start + (end - start) / 2)
+
+later_range <- PERIOD_DEFS %>%
+  dplyr::filter(label == "Later period") %>%
+  dplyr::mutate(label = "Later\nperiod", midpoint = start + (end - start) / 2)
+
+surge_window_lines <- data.frame(start = as.Date(c(surge_ranges$start, surge_ranges$end)))
+later_window_lines <- data.frame(start = as.Date(c(later_range$start, later_range$end)))
+
+base_theme <- theme_classic(base_size = 11) +
+  theme(
+    plot.title.position = "plot",
+    plot.title = element_text(face = "bold", size = 12, margin = margin(b = 6)),
+    axis.title.x = element_blank(),
+    axis.title.y = element_text(margin = margin(r = 6)),
+    axis.text.x = element_text(hjust = 0.5),
+    legend.position = "top",
+    legend.title = element_blank(),
+    plot.margin = margin(5, 10, 5, 5)
+  )
+
+date_scale <- scale_x_date(
+  date_breaks = "2 months",
+  date_labels = "%b %Y",
+  expand = expansion(add = 5)
+)
+
+title_theme <- theme(plot.title = element_text(face = "bold", size = 14, hjust = 0))
+```
+
+```{r}
+# ---- Panel A ----
+df_ts_obs <- pred_compare_46 %>%
+  dplyr::group_by(date) %>%
+  dplyr::summarise(obs_med = median(obs), .groups = "drop")
+
+rect_ymin <- max(6.5, ceiling((max(df_ts_obs$obs_med) + 0.25) * 10) / 10)
+rect_ymax <- rect_ymin + 1.2
+text_y <- (rect_ymin + rect_ymax) / 2
+panel_A_top <- rect_ymax + 0.5
+
+period_marker <- function(lines_df, ranges_df, colour, label_size) {
+  list(
+    geom_segment(
+      data = lines_df,
+      aes(x = start, xend = start, y = 0, yend = rect_ymin),
+      inherit.aes = FALSE, color = colour, linetype = "dashed", linewidth = 0.5
+    ),
+    geom_rect(
+      data = ranges_df,
+      aes(xmin = start, xmax = end, ymin = rect_ymin, ymax = rect_ymax),
+      inherit.aes = FALSE, fill = colour, color = NA
+    ),
+    geom_text(
+      data = ranges_df,
+      aes(x = midpoint, y = text_y, label = label),
+      inherit.aes = FALSE, color = "white", fontface = "bold",
+      size = label_size, vjust = 0.5, lineheight = 0.8
+    )
+  )
+}
+
+pA <- ggplot(df_ts_obs, aes(x = date, y = obs_med)) +
+  geom_col(fill = "grey60", color = "black", width = 7, alpha = 0.7) +
+  period_marker(surge_window_lines, surge_ranges, "#d62728", 4) +
+  period_marker(later_window_lines, later_range, "grey45", 3.5) +
+  labs(title = "A", y = "Hospital admissions", x = NULL) +
+  date_scale + base_theme + title_theme +
+  coord_cartesian(ylim = c(0, panel_A_top), expand = FALSE, clip = "off") +
+  theme(
+    legend.position = "none",
+    plot.margin = margin(t = 15, r = 15, b = 5, l = 5)
+  )
+```
+
+```{r}
+# ---- Panel B ----
+error_time <- pred_compare_46 %>%
+  dplyr::group_by(date) %>%
+  dplyr::summarise(
+    median_error_with = median(abs(pred_with - obs)),
+    median_error_without = median(abs(pred_without - obs)),
+    n_states = dplyr::n_distinct(state),
+    .groups = "drop"
+  )
+
+stopifnot(
+  nrow(error_time) == dplyr::n_distinct(pred_compare_46$date),
+  all(error_time$n_states == 46),
+  all(is.finite(error_time$median_error_with)),
+  all(is.finite(error_time$median_error_without))
+)
+
+pB <- ggplot(error_time, aes(x = date)) +
+  geom_vline(
+    data = window_lines,
+    aes(xintercept = as.numeric(start)),
+    inherit.aes = FALSE,
+    color = "grey70", linetype = "dashed", linewidth = 0.5
+  ) +
+  geom_line(aes(y = median_error_with, color = "With hospital admissions"),
+            linewidth = 0.9) +
+  geom_line(aes(y = median_error_without, color = "Without hospital admissions"),
+            linewidth = 0.9) +
+  scale_color_manual(values = c(
+    "With hospital admissions" = "steelblue",
+    "Without hospital admissions" = "darkorange"
+  )) +
+  labs(title = "B", x = "Date", y = "Median absolute error", color = NULL) +
+  date_scale + base_theme + title_theme +
+  theme(
+    legend.position = "top",
+    legend.justification = "center",
+    legend.key.width = unit(1.2, "cm"),
+    legend.text = element_text(size = 9.5),
+    legend.margin = margin(t = 0, b = 2),
+    axis.title.x = element_text(margin = margin(t = 6))
+  ) +
+  guides(color = guide_legend(nrow = 1))
+```
+
+```{r}
+# ---- Panel C ----
+assign_period <- function(d) {
+  idx <- which(d >= PERIOD_DEFS$start & d <= PERIOD_DEFS$end)
+  if (length(idx) == 1) PERIOD_DEFS$label[idx] else NA_character_
+}
+
+diff_surge_data <- pred_compare_46 %>%
+  dplyr::mutate(period = vapply(date, assign_period, character(1))) %>%
+  dplyr::filter(!is.na(period)) %>%
+  dplyr::group_by(period, state) %>%
+  dplyr::summarise(
+    rmse_with = sqrt(mean((pred_with - obs)^2)),
+    rmse_without = sqrt(mean((pred_without - obs)^2)),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(
+    period = factor(period, levels = PERIOD_DEFS$label),
+    RMSE_Reduction = rmse_without - rmse_with
+  )
+
+surge_check <- diff_surge_data %>%
+  dplyr::group_by(period) %>%
+  dplyr::summarise(
+    n_states = dplyr::n(),
+    median_reduction = median(RMSE_Reduction),
+    n_states_better_with = sum(RMSE_Reduction > 0),
+    .groups = "drop"
+  )
+
+stopifnot(nrow(surge_check) == 3, all(surge_check$n_states == 46))
+
+print(surge_check)
+
+c_lo <- floor((min(diff_surge_data$RMSE_Reduction) - 0.15) * 10) / 10
+c_hi <- ceiling((max(diff_surge_data$RMSE_Reduction) + 0.15) * 10) / 10
+
+pC <- ggplot(diff_surge_data, aes(x = period, y = RMSE_Reduction)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "#d62728", linewidth = 1) +
+  geom_boxplot(width = 0.35, fill = "steelblue", alpha = 0.4,
+               color = "black", outlier.shape = NA) +
+  geom_point(position = position_jitter(width = 0.12, seed = 2122),
+             size = 0.75, alpha = 0.7, color = "darkblue") +
+  scale_x_discrete(labels = c("Later period" = "Later\nperiod")) +
+  scale_y_continuous(breaks = scales::pretty_breaks(n = 6)) +
+  coord_cartesian(ylim = c(c_lo, c_hi)) +
+  labs(title = "C", x = NULL, y = "Reduction in RMSE") +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14, hjust = 0),
+    axis.text.x = element_text(face = "bold", size = 10),
+    axis.title.y = element_text(margin = margin(r = 6)),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.y = element_blank()
+  )
+```
+
+```{r}
+final_all <- ((pA / pB) | pC) + plot_layout(widths = c(1.8, 1))
+
+print(final_all)
+
+ggsave(
+  "Fig5_admissions_and_error_46states.png",
+  final_all,
+  width = 11, height = 6, dpi = 300, bg = "white"
+)
+```
+
+
+# Figure S1
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(patchwork)
+
+
+COMMON_EXCLUDE <- c("IA", "MN", "MO", "OK")
+
+pred_labs <- c(
+  Hospital.Admissions   = "bold('Hospital admissions (per 100k)')",
+  Test.Positivity       = "bold('Test positivity (%)')",
+  ED.visits             = "bold('ED visits (% of visits)')",
+  Wearing.Masks         = "bold('Wearing masks (%)')",
+  Doctor.Visits         = "bold('Outpatient visits (per 100k)')",
+  Symtoms               = "bold('Symptoms (%)')",
+  Distributed           = "bold('Vaccines distributed (per 100k)')",
+  Symtoms.in.community  = "bold('Symptoms in community (%)')",
+  Deaths                = "bold('Deaths (per 100k)')",
+  Cases                 = "bold('Cases (per 100k)')",
+  index                 = "bold('Policy stringency index')",
+  climate               = "bold('Relative climate '*R[0])"
+)
+
+page1_vars <- names(pred_labs)[1:6]
+page2_vars <- names(pred_labs)[7:12]
+
+data_long <- final_data %>%
+  dplyr::filter(!state %in% COMMON_EXCLUDE) %>%
+  dplyr::select(date, state, dplyr::all_of(names(pred_labs))) %>%
+  tidyr::pivot_longer(
+    dplyr::all_of(names(pred_labs)),
+    names_to = "predictor", values_to = "value"
+  ) %>%
+  dplyr::group_by(date, predictor) %>%
+  dplyr::summarise(median_value = median(value, na.rm = TRUE), .groups = "drop")
+
+accent <- "#2C6E8F"
+
+build_page <- function(vars) {
+
+  d <- data_long %>%
+    dplyr::filter(predictor %in% vars) %>%
+    dplyr::mutate(predictor = factor(predictor, levels = vars,
+                                     labels = pred_labs[vars]))
+
+  ggplot(d, aes(date, median_value)) +
+    geom_area(fill = accent, alpha = 0.12) +
+    geom_line(color = accent, linewidth = 0.7) +
+    facet_wrap(~ predictor, scales = "free_y", ncol = 2, labeller = label_parsed) +
+    scale_x_date(
+      date_labels = "%b\n%Y", date_breaks = "3 months",
+      expand = expansion(mult = c(0.02, 0.02))
+    ) +
+    labs(x = NULL, y = "Weekly median across the 46 states") +
+    theme_minimal(base_size = 10) +
+    theme(
+      strip.text = element_text(face = "bold", size = 9, hjust = 0.5,
+                                margin = margin(b = 3)),
+      panel.grid.minor = element_blank(),
+      panel.grid.major.x = element_blank(),
+      panel.spacing = unit(1.1, "lines"),
+      axis.text = element_text(size = 8, color = "grey30"),
+      axis.title.y = element_text(size = 9, color = "grey30", margin = margin(r = 6)),
+      plot.margin = margin(10, 14, 8, 10)
+    )
+}
+
+p1 <- build_page(page1_vars)
+p2 <- build_page(page2_vars)
+
+print(p1)
+print(p2)
+
+ggsave("FigS1_predictor_series_page1.png", p1,
+       width = 8.5, height = 8, dpi = 300, bg = "white")
+ggsave("FigS1_predictor_series_page2.png", p2,
+       width = 8.5, height = 8, dpi = 300, bg = "white")
+```
+
+
+# Figures S2 and S3
+
+```{r}
+library(dplyr)
+library(purrr)
+library(tibble)
+
+stopifnot(exists("COMMON_EXCLUDE_STATES"))
+
+source_list <- c(
+  "Wearing Masks", "Symptoms", "Symptoms in Community", "Outpatient Visits",
+  "Test Positivity", "Cases", "Deaths", "Vaccinations",
+  "Policy Index", "Climate", "Hospital Admissions", "ED Visits"
+)
+
+compute_all_median_46 <- function(lag_suffix) {
+
+  purrr::map_dfr(1:12, function(k) {
+
+    object_name <- paste0("comb", k, "_median_vac.", lag_suffix)
+    if (!exists(object_name, envir = .GlobalEnv)) {
+      stop("Object not found: ", object_name)
+    }
+
+    pred_list  <- get(object_name, envir = .GlobalEnv)$y_predicted_new
+    combo_list <- combn(1:12, k, simplify = FALSE)
+
+    if (length(pred_list) != length(combo_list)) {
+      stop("lag=", lag_suffix, ", k=", k,
+           ": number of predictions does not match number of combinations")
+    }
+
+    purrr::imap_dfr(pred_list, function(pred_tibble, combo_index) {
+
+      predictor_vector <- combo_list[[combo_index]]
+
+      pred_common_46 <- pred_tibble %>%
+        dplyr::mutate(state = as.character(state)) %>%
+        dplyr::filter(!state %in% COMMON_EXCLUDE_STATES)
+
+      if (dplyr::n_distinct(pred_common_46$state) != 46) {
+        stop("lag=", lag_suffix, ", k=", k, ", idx=", combo_index,
+             ": expected 46 states")
+      }
+
+      state_rmse_46 <- pred_common_46 %>%
+        dplyr::group_by(state) %>%
+        dplyr::summarise(rmse = sqrt(mean((pred - obs)^2)), .groups = "drop")
+
+      tibble::tibble(
+        lag = lag_suffix,
+        k = k,
+        combo_index = combo_index,
+        predictor_numbers = paste(predictor_vector, collapse = ", "),
+        predictor_names = paste(source_list[predictor_vector], collapse = ", "),
+        has_hospitalization = 11L %in% predictor_vector,
+        median_state_rmse_46 = median(state_rmse_46$rmse)
+      )
+    })
+  })
+}
+
+all_lag1_46 <- compute_all_median_46("lag1")
+all_lag2_46 <- compute_all_median_46("lag2")
+all_lag3_46 <- compute_all_median_46("lag3")
+```
+
+```{r}
+trunc3 <- function(x) trunc(x * 1000) / 1000
+
+best_by_k <- function(all_df, has_hosp) {
+  all_df %>%
+    dplyr::filter(has_hospitalization == has_hosp, k %in% 1:11) %>%
+    dplyr::group_by(k) %>%
+    dplyr::arrange(median_state_rmse_46, combo_index, .by_group = TRUE) %>%
+    dplyr::slice(1) %>%
+    dplyr::ungroup() %>%
+    dplyr::transmute(
+      x = factor(k, levels = 1:11),
+      y_full = median_state_rmse_46,
+      y = trunc3(median_state_rmse_46)
+    )
+}
+
+make_decomp_plot <- function(all_df, out_png) {
+
+  df1 <- best_by_k(all_df, TRUE)
+  df2 <- best_by_k(all_df, FALSE)
+
+  df_pct <- data.frame(
+    x = df1$x,
+    pct = round((df2$y_full - df1$y_full) / df2$y_full * 100, 1),
+    mid_y = (df1$y + df2$y) / 2
+  )
+
+  y_max <- max(c(df1$y, df2$y)) + 0.3
+
+  square_size <- 0.12
+  square_width <- 0.37
+  legend_x <- 0.7
+  legend_y <- y_max + 0.1
+
+  graph <- ggplot() +
+    geom_col(data = df2, aes(x = x, y = y), fill = "steelblue", alpha = 0.3) +
+    geom_col(data = df1, aes(x = x, y = y), fill = "steelblue", alpha = 0.75) +
+    geom_text(
+      data = df_pct,
+      aes(x = x, y = mid_y, label = paste0(pct, "%")),
+      color = "black", size = 3.3
+    ) +
+    annotate(
+      "rect",
+      xmin = legend_x, xmax = legend_x + square_width,
+      ymin = legend_y, ymax = legend_y - square_size,
+      fill = "steelblue", alpha = 0.3
+    ) +
+    annotate(
+      "text",
+      x = legend_x + square_width + 0.10,
+      y = legend_y - square_size / 2,
+      label = "Excluding hospital admissions", hjust = 0, size = 3.7
+    ) +
+    annotate(
+      "rect",
+      xmin = legend_x, xmax = legend_x + square_width,
+      ymin = legend_y - square_size - 0.04,
+      ymax = legend_y - 2 * square_size - 0.04,
+      fill = "steelblue", alpha = 0.75
+    ) +
+    annotate(
+      "text",
+      x = legend_x + square_width + 0.10,
+      y = legend_y - square_size * 1.5 - 0.04,
+      label = "Including hospital admissions", hjust = 0, size = 3.7
+    ) +
+    labs(x = "Number of covariates", y = "RMSE") +
+    coord_cartesian(ylim = c(0, y_max), clip = "off") +
+    theme(
+      text = element_text(size = 14),
+      panel.background = element_rect(fill = "white"),
+      plot.background = element_rect(fill = "white"),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      axis.line = element_line(color = "black"),
+      axis.ticks = element_line(color = "black"),
+      plot.margin = margin(10, 30, 10, 10)
+    )
+
+  ggsave(out_png, graph, width = 6.5, height = 4, dpi = 300)
+
+  list(graph = graph, df_pct = df_pct)
+}
+
+figS2 <- make_decomp_plot(all_lag1_46, "FigS2_rmse_decomposition_1week.png")
+figS3 <- make_decomp_plot(all_lag2_46, "FigS3_rmse_decomposition_2week.png")
+
+print(figS2$graph)
+print(figS3$graph)
+```
+
+
+# Figure S4
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(purrr)
+
+
+ADMISSIONS_INDEX  <- 11L
+N_STATES_EXPECTED <- 46L
+HEATMAP_HORIZON   <- 3L
+
+stopifnot(source_list[ADMISSIONS_INDEX] == "Hospital Admissions")
+
+combo_members <- function(k, idx) as.integer(combn(12, k, simplify = FALSE)[[idx]])
+
+all_rmse <- purrr::map_dfr(1:3, function(h) {
+  purrr::map_dfr(1:12, function(k) {
+
+    obj_name <- sprintf("comb%d_median_vac.lag%d", k, h)
+    if (!exists(obj_name)) stop("Object not found: ", obj_name)
+
+    purrr::imap_dfr(get(obj_name)$y_predicted_new, function(pred_tbl, combo_index) {
+
+      state_rmse <- pred_tbl %>%
+        dplyr::mutate(state = as.character(state)) %>%
+        dplyr::filter(!state %in% COMMON_EXCLUDE_STATES) %>%
+        dplyr::group_by(state) %>%
+        dplyr::summarise(rmse = sqrt(mean((pred - obs)^2)), .groups = "drop")
+
+      tibble::tibble(
+        horizon = h,
+        k = k,
+        combo_index = as.integer(combo_index),
+        median_rmse = median(state_rmse$rmse),
+        n_states = nrow(state_rmse)
+      )
+    })
+  })
+}) %>%
+  dplyr::rowwise() %>%
+  dplyr::mutate(
+    members = list(combo_members(k, combo_index)),
+    has_admissions = ADMISSIONS_INDEX %in% members
+  ) %>%
+  dplyr::ungroup()
+
+expected_counts <- all_rmse %>%
+  dplyr::count(horizon, k, name = "n_combos") %>%
+  dplyr::mutate(expected = choose(12, k))
+
+stopifnot(
+  all(all_rmse$n_states == N_STATES_EXPECTED),
+  all(is.finite(all_rmse$median_rmse)),
+  all(expected_counts$n_combos == expected_counts$expected)
+)
+
+univ_k1 <- all_rmse %>%
+  dplyr::filter(horizon == HEATMAP_HORIZON, k == 1) %>%
+  dplyr::rowwise() %>%
+  dplyr::mutate(Source = source_list[members[[1]]]) %>%
+  dplyr::ungroup() %>%
+  dplyr::arrange(median_rmse)
+
+stopifnot(nrow(univ_k1) == 12L, !anyDuplicated(univ_k1$Source))
+
+source_levels <- rev(univ_k1$Source)
+
+best_by_size <- function(include_admissions) {
+  all_rmse %>%
+    dplyr::filter(has_admissions == include_admissions) %>%
+    dplyr::group_by(horizon, k) %>%
+    dplyr::arrange(median_rmse, combo_index, .by_group = TRUE) %>%
+    dplyr::slice(1) %>%
+    dplyr::ungroup() %>%
+    dplyr::arrange(horizon, k)
+}
+
+best_with    <- best_by_size(TRUE)
+best_without <- best_by_size(FALSE)
+
+stopifnot(
+  identical(sort(unique(best_with$k)), 1:12),
+  identical(sort(unique(best_without$k)), 1:11)
+)
+
+make_strip_data <- function(best_tbl) {
+  best_tbl %>%
+    dplyr::select(horizon, k, median_rmse) %>%
+    tidyr::pivot_wider(names_from = horizon, values_from = median_rmse,
+                       names_prefix = "h") %>%
+    dplyr::transmute(
+      Combination = factor(k, levels = sort(unique(k))),
+      ymin = trunc3(h1),
+      yline = trunc3(h2),
+      ymax = trunc3(h3)
+    ) %>%
+    dplyr::arrange(Combination)
+}
+
+make_df_selected <- function(best_tbl) {
+
+  b <- best_tbl %>%
+    dplyr::filter(horizon == HEATMAP_HORIZON) %>%
+    dplyr::arrange(k)
+
+  selected <- setNames(
+    lapply(seq_len(nrow(b)), function(i) source_list[b$members[[i]]]),
+    paste0("comb", b$k)
+  )
+
+  df <- expand.grid(Source = source_levels, Combination = names(selected),
+                    stringsAsFactors = FALSE)
+  df$Selected <- 0L
+
+  for (cmb in names(selected)) {
+    df$Selected[df$Combination == cmb & df$Source %in% selected[[cmb]]] <- 1L
+  }
+
+  df$Combination <- factor(
+    gsub("comb", "", df$Combination),
+    levels = as.character(sort(as.integer(gsub("comb", "", names(selected)))))
+  )
+  df$Source <- factor(df$Source, levels = source_levels)
+  df
+}
+
+strip_data_with <- make_strip_data(best_with)
+strip_data_without <- make_strip_data(best_without) %>%
+  dplyr::filter(as.character(Combination) != "12") %>%
+  dplyr::mutate(Combination = droplevels(Combination))
+
+df_selected_with <- make_df_selected(best_with)
+df_selected_without <- make_df_selected(best_without) %>%
+  dplyr::filter(Combination != "12") %>%
+  dplyr::mutate(Combination = droplevels(Combination))
+
+size_check <- df_selected_without %>%
+  dplyr::group_by(Combination) %>%
+  dplyr::summarise(n_sel = sum(Selected), .groups = "drop") %>%
+  dplyr::mutate(k = as.integer(as.character(Combination)))
+
+stopifnot(
+  all(df_selected_with$Selected[df_selected_with$Source == "Hospital Admissions"] == 1),
+  sum(df_selected_without$Selected[df_selected_without$Source == "Hospital Admissions"]) == 0,
+  all(size_check$n_sel == size_check$k)
+)
+```
+
+```{r}
+library(ggplot2)
+library(patchwork)
+library(cowplot)
+
+Y_LIMITS <- c(0.3, 1.5)
+Y_BREAKS <- seq(0.4, 1.4, by = 0.2)
+
+strip_segment <- function(y_var, width) {
+  geom_segment(
+    aes(
+      x = as.numeric(Combination) - 0.5,
+      xend = as.numeric(Combination) + 0.5,
+      y = .data[[y_var]], yend = .data[[y_var]]
+    ),
+    color = "black", linewidth = width
+  )
+}
+
+make_panel <- function(df_selected, strip_data) {
+
+  heatmap_plot <- ggplot(
+    df_selected,
+    aes(x = as.numeric(Combination), y = Source, fill = factor(Selected))
+  ) +
+    geom_tile(color = "grey80", alpha = 0.8, width = 1, height = 1) +
+    scale_x_continuous(breaks = 1:12, labels = 1:12, expand = expansion(add = 0)) +
+    scale_fill_manual(
+      values = c("0" = "white", "1" = "steelblue"),
+      labels = c("0" = "excluded", "1" = "included"),
+      name = NULL
+    ) +
+    scale_y_discrete(limits = source_levels, expand = c(0, 0)) +
+    labs(x = "Number of predictors included", y = NULL) +
+    theme_minimal(base_size = 10) +
+    theme(
+      text = element_text(color = "black"),
+      axis.text = element_text(color = "black"),
+      axis.title = element_text(color = "black"),
+      axis.text.y = element_blank(),
+      axis.ticks.y = element_blank(),
+      legend.position = "none",
+      panel.grid.major.x = element_line(color = "grey90")
+    )
+
+  strip_plot <- ggplot(strip_data) +
+    geom_segment(
+      aes(x = as.numeric(Combination) - 0.5, xend = as.numeric(Combination) - 0.5,
+          y = ymin, yend = ymax),
+      color = "grey60", linewidth = 0.3
+    ) +
+    geom_segment(
+      aes(x = as.numeric(Combination) + 0.5, xend = as.numeric(Combination) + 0.5,
+          y = ymin, yend = ymax),
+      color = "grey60", linewidth = 0.3
+    ) +
+    strip_segment("ymin",  0.5) +
+    strip_segment("yline", 0.9) +
+    strip_segment("ymax",  1.5) +
+    scale_x_continuous(breaks = 1:12, labels = 1:12, expand = expansion(add = 0)) +
+    scale_y_continuous(breaks = Y_BREAKS, limits = Y_LIMITS) +
+    coord_cartesian(ylim = Y_LIMITS) +
+    labs(y = "RMSE", x = NULL) +
+    theme_minimal(base_size = 9) +
+    theme(
+      text = element_text(color = "black"),
+      axis.text = element_text(color = "black", size = 7),
+      axis.title = element_text(color = "black", size = 8),
+      axis.text.x = element_blank(),
+      axis.ticks.x = element_blank(),
+      panel.grid.major.x = element_blank(),
+      panel.grid.minor.x = element_blank(),
+      panel.grid.major.y = element_line(color = "grey90"),
+      plot.margin = margin(t = 6, r = 0, b = 0, l = 0)
+    )
+
+  (strip_plot / heatmap_plot) + plot_layout(heights = c(1, 5))
+}
+
+legend_df <- data.frame(
+  x = 1,
+  y = 5:1,
+  type = factor(
+    c("included", "excluded", "1 week", "2 weeks", "3 weeks"),
+    levels = c("included", "excluded", "1 week", "2 weeks", "3 weeks")
+  )
+)
+
+legend_plot <- ggplot() +
+  geom_tile(
+    data = subset(legend_df, type %in% c("included", "excluded")),
+    aes(x = x, y = y, fill = type),
+    width = 0.4, height = 0.25, color = "grey50", alpha = 0.8
+  ) +
+  geom_segment(
+    data = subset(legend_df, type %in% c("1 week", "2 weeks", "3 weeks")),
+    aes(x = x - 0.3, xend = x + 0.3, y = y, yend = y,
+        linetype = type, linewidth = type),
+    color = "black"
+  ) +
+  scale_fill_manual(
+    name = NULL,
+    values = c("included" = "steelblue", "excluded" = "white"),
+    breaks = c("included", "excluded")
+  ) +
+  scale_linetype_manual(
+    name = NULL,
+    values = c("1 week" = "solid", "2 weeks" = "solid", "3 weeks" = "solid")
+  ) +
+  scale_linewidth_manual(
+    name = NULL,
+    values = c("1 week" = 0.5, "2 weeks" = 0.9, "3 weeks" = 1.5)
+  ) +
+  theme_void() +
+  theme(
+    legend.position = "right",
+    legend.text = element_text(size = 8, colour = "black")
+  )
+
+labels_df <- data.frame(
+  Source = source_levels,
+  y = seq(1, by = 0.22, length.out = length(source_levels))
+)
+
+label_plot <- ggplot(labels_df, aes(x = 1.54, y = y, label = Source)) +
+  geom_text(hjust = 1, vjust = 0.5, size = 2.9) +
+  coord_cartesian(
+    xlim = c(0.7, 1.5),
+    ylim = c(min(labels_df$y) - 0.3, max(labels_df$y) + 0.3),
+    clip = "off"
+  ) +
+  theme_void() +
+  theme(plot.margin = margin(t = 35, r = 0, b = 5, l = 5))
+
+final_two_panels <- cowplot::plot_grid(
+  label_plot,
+  make_panel(df_selected_with, strip_data_with),
+  make_panel(df_selected_without, strip_data_without),
+  cowplot::get_legend(legend_plot),
+  nrow = 1,
+  rel_widths = c(0.49, 1, 1, 0.29),
+  labels = c("", "A", "B", ""),
+  label_size = 12,
+  label_y = 0.99
+)
+
+final_two_panels
+
+ggsave("FigS4_predictor_selection_with_without.png",
+       final_two_panels, width = 8, height = 4, dpi = 300, bg = "white")
+```
+
+
+
+# Figure S5
+
+```{r}
+library(usmap)
+library(scales)
+library(grid)
+
+
+if (!exists("pred_with_final_46")) {
+  pred_with_final_46 <- get("comb6_median_vac.lag3", envir = .GlobalEnv)$y_predicted_new[[105]] %>%
+    dplyr::transmute(state = as.character(state), date = as.Date(date), obs, pred) %>%
+    dplyr::filter(!state %in% COMMON_EXCLUDE_STATES)
+}
+
+rmse_with_final_46 <- pred_with_final_46 %>%
+  dplyr::group_by(state) %>%
+  dplyr::summarise(
+    rmse = sqrt(mean((pred - obs)^2)),
+    n_predictions = dplyr::n(),
+    .groups = "drop"
+  )
+
+stopifnot(
+  nrow(rmse_with_final_46) == 46,
+  all(rmse_with_final_46$n_predictions == 50)
+)
+
+rmse_levels <- c("<0.75", "0.75–0.99", "1.00–1.24",
+                 "1.25–1.49", "1.50–1.99", "≥2.00", "Excluded")
+
+map_rmse_with_50 <- usmap::us_map(regions = "states") %>%
+  dplyr::distinct(abbr) %>%
+  dplyr::rename(state = abbr) %>%
+  dplyr::left_join(rmse_with_final_46, by = "state") %>%
+  dplyr::mutate(
+    rmse_group = dplyr::case_when(
+      state %in% COMMON_EXCLUDE_STATES ~ "Excluded",
+      rmse < 0.75 ~ "<0.75",
+      rmse < 1.00 ~ "0.75–0.99",
+      rmse < 1.25 ~ "1.00–1.24",
+      rmse < 1.50 ~ "1.25–1.49",
+      rmse < 2.00 ~ "1.50–1.99",
+      TRUE ~ "≥2.00"
+    ),
+    rmse_group = factor(rmse_group, levels = rmse_levels)
+  )
+
+rmse_palette <- c(
+  "<0.75"     = "#F7FBFF",
+  "0.75–0.99" = "#DEEBF7",
+  "1.00–1.24" = "#C6DBEF",
+  "1.25–1.49" = "#9ECAE1",
+  "1.50–1.99" = "#6BAED6",
+  "≥2.00"     = "#2171B5",
+  "Excluded"  = "#D9D9D9"
+)
+
+p_figS5 <- plot_usmap(
+  data = map_rmse_with_50,
+  values = "rmse_group",
+  regions = "states",
+  color = "grey25",
+  linewidth = 0.25
+) +
+  scale_fill_manual(
+    values = rmse_palette,
+    drop = FALSE,
+    name = "State-specific RMSE",
+    guide = guide_legend(override.aes = list(color = NA, linewidth = 0))
+  ) +
+  theme_void(base_size = 11) +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(size = 9.5, face = "plain"),
+    legend.text = element_text(size = 9),
+    legend.key.size = unit(0.42, "cm"),
+    legend.spacing.y = unit(0.10, "cm"),
+    legend.key = element_rect(color = NA),
+    legend.background = element_blank(),
+    legend.box.background = element_blank(),
+    plot.margin = margin(5, 10, 5, 5)
+  )
+
+p_figS5
+
+ggsave("FigS5_state_rmse_map.png", p_figS5,
+       width = 7.2, height = 4.4, dpi = 300, bg = "white")
+```
+
+
+# Figure S6
+
+```{r}
+library(dplyr)
+library(purrr)
+library(ggplot2)
+library(patchwork)
+library(cowplot)
+
+
+state_pages <- split(
+  sort(unique(as.character(pred_with_final_46$state))),
+  ceiling(seq_len(46) / 8)
+)
+
+stopifnot(
+  length(unlist(state_pages)) == 46,
+  length(state_pages) == 6
+)
+
+add_without_forecast <- function(base_plot, state_name) {
+
+  without_data <- pred_without_final_46 %>%
+    dplyr::filter(state == state_name) %>%
+    dplyr::arrange(date)
+
+  base_plot +
+    geom_line(
+      data = without_data,
+      aes(x = date, y = pred, color = "Without hospital admissions"),
+      inherit.aes = FALSE, linewidth = 0.9
+    )
+}
+
+make_state_panel <- function(state_name, y_max) {
+
+  base_plot <- plot_with_and_without_hosp_new(
+    state_name,
+    pred_with_final_46,
+    pred_without_final_46,
+    ylim_range = c(0, y_max)
+  )[[2]]
+
+  short_months(add_without_forecast(base_plot, state_name))
+}
+
+legend_state <- state_pages[[1]][1]
+
+legend_with_and_without <- cowplot::get_legend(
+  make_state_panel(legend_state, 12) + theme(legend.position = "bottom")
+)
+
+make_eight_state_page <- function(states) {
+
+  page_with <- pred_with_final_46 %>% dplyr::filter(state %in% states)
+  page_without <- pred_without_final_46 %>% dplyr::filter(state %in% states)
+
+  y_max <- max(
+    12,
+    ceiling(max(c(page_with$obs, page_with$pred, page_without$pred)) * 1.05 * 2) / 2
+  )
+
+  state_full_names <- state.name[match(states, state.abb)]
+
+  
+  panel_plots <- lapply(seq_along(states), function(i) {
+
+    base_plot <- make_state_panel(states[i], y_max) +
+      theme(legend.position = "none") +
+      upright_x_bottom
+
+    keep_y <- i %in% c(1, 5)
+
+    if (keep_y) base_plot <- base_plot + labs(y = "Hospital Admissions")
+
+    top_with_state(base_plot, state_name = state_full_names[i], keep_y = keep_y)
+  })
+
+  while (length(panel_plots) < 8) {
+    panel_plots <- append(panel_plots, list(patchwork::plot_spacer()))
+  }
+
+  main_plot <- cowplot::plot_grid(
+    cowplot::ggdraw(patchwork::wrap_plots(panel_plots[1:4], ncol = 4)),
+    cowplot::ggdraw(patchwork::wrap_plots(panel_plots[5:8], ncol = 4)),
+    ncol = 1,
+    rel_heights = c(1, 1),
+    align = "v",
+    axis = "lr"
+  )
+
+  cowplot::plot_grid(
+    main_plot,
+    legend_with_and_without,
+    ncol = 1,
+    rel_heights = c(1, 0.12)
+  )
+}
+
+all46_pages <- lapply(state_pages, make_eight_state_page)
+
+purrr::walk(all46_pages, print)
+
+dir.create("Fig_S6_all_states", showWarnings = FALSE)
+
+purrr::iwalk(all46_pages, function(p, i) {
+  ggsave(
+    filename = file.path("Fig_S6_all_states",
+                         sprintf("FigS6_page_%02d.png", as.integer(i))),
+    plot = p,
+    width = 7, height = 5, dpi = 300, bg = "white"
+  )
+})
+```
+
+

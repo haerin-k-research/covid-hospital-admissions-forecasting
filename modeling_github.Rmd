@@ -1,0 +1,262 @@
+---
+title: "Untitled"
+output: html_document
+date: "2026-08-23"
+---
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(splines)
+library(glmnet)
+library(tibble)
+library(purrr)
+library(patchwork)
+library(ggplot2)
+library(cowplot)
+library(grid)
+
+source("functions_modeling.R")
+```
+
+```{r}
+# States excluded for specific predictor blocks
+predictor_block_exclusions <- list(
+  `5`  = list(states = "IA", date_range = NULL),               # Test.Positivity
+  `12` = list(states = c("MN", "MO", "OK"), date_range = NULL) # ED.visits
+)
+
+# States excluded from the common evaluation set
+COMMON_EXCLUDE_STATES <- c("IA", "MN", "MO", "OK")
+
+save_dir <- "results/model_fits"
+dir.create(save_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+```{r}
+final_data <- readRDS("analysis_data.rds") %>%
+  dplyr::mutate(
+    date  = as.Date(date),
+    state = as.character(state)
+  ) %>%
+  dplyr::arrange(date, state)
+
+stopifnot(
+  nrow(final_data) == 3500,
+  dplyr::n_distinct(final_data$date) == 70,
+  dplyr::n_distinct(final_data$state) == 50,
+  !anyDuplicated(final_data[c("state", "date")]),
+  all(rle(as.character(final_data$date))$lengths == 50)
+)
+```
+
+# Fit all predictor combinations across forecast horizons
+
+```{r}
+for (wlag in 1:3) {
+   for (k in 1:12) {
+     result_k <- run_stateaware_by_k_checked(
+       k = k,
+       wlag = wlag,
+       dataset = final_data,
+       n_states = 50,
+       exclusion_rules = predictor_block_exclusions,
+       save_dir = save_dir
+     )
+     rm(result_k)
+     gc()
+   }
+}
+```
+
+# Load fitted objects
+
+```{r}
+for (wlag in 1:3) {
+  for (k in 1:12) {
+    assign(
+      paste0("comb", k, "_median_vac.lag", wlag),
+      readRDS(file.path(save_dir, paste0("stateaware_k", k, "_wlag", wlag, ".rds"))),
+      envir = .GlobalEnv
+    )
+  }
+}
+```
+
+# State-specific RMSE for every candidate model (3-week horizon)
+
+```{r}
+all_state_median_results <- purrr::map_dfr(1:12, function(k) {
+
+  object_name <- paste0("comb", k, "_median_vac.lag3")
+  if (!exists(object_name, envir = .GlobalEnv)) {
+    stop("Object not found: ", object_name)
+  }
+
+  pred_list  <- get(object_name, envir = .GlobalEnv)$y_predicted_new
+  combo_list <- combn(1:12, k, simplify = FALSE)
+
+  if (length(pred_list) != length(combo_list)) {
+    stop("k = ", k, ": number of predictions does not match number of combinations")
+  }
+
+  purrr::imap_dfr(pred_list, function(pred_tibble, combo_index) {
+
+    if (!all(c("state", "obs", "pred") %in% names(pred_tibble))) {
+      stop("k = ", k, ", combo_index = ", combo_index, ": missing required columns")
+    }
+
+    if (any(!is.finite(pred_tibble$obs)) || any(!is.finite(pred_tibble$pred))) {
+      stop("k = ", k, ", combo_index = ", combo_index, ": non-finite obs/pred")
+    }
+
+    pred_tibble <- pred_tibble %>%
+      dplyr::mutate(state = as.character(state))
+
+    # All states available to this model
+    state_rmse_available <- pred_tibble %>%
+      dplyr::group_by(state) %>%
+      dplyr::summarise(rmse = sqrt(mean((pred - obs)^2)), .groups = "drop")
+
+    # Common 46-state evaluation set
+    pred_common_46 <- pred_tibble %>%
+      dplyr::filter(!state %in% COMMON_EXCLUDE_STATES)
+
+    n_common_states <- dplyr::n_distinct(pred_common_46$state)
+    if (n_common_states != 46) {
+      stop("k = ", k, ", combo_index = ", combo_index,
+           ": ", n_common_states, " states after filtering; expected 46")
+    }
+
+    predictions_per_state <- pred_common_46 %>%
+      dplyr::count(state, name = "n_predictions")
+
+    if (any(predictions_per_state$n_predictions != 50)) {
+      stop("k = ", k, ", combo_index = ", combo_index,
+           ": expected 50 predictions per state")
+    }
+
+    if (nrow(pred_common_46) != 2300) {
+      stop("k = ", k, ", combo_index = ", combo_index,
+           ": ", nrow(pred_common_46), " predictions; expected 2300")
+    }
+
+    state_rmse_46 <- pred_common_46 %>%
+      dplyr::group_by(state) %>%
+      dplyr::summarise(rmse = sqrt(mean((pred - obs)^2)), .groups = "drop")
+
+    tibble::tibble(
+      k = k,
+      combo_index = combo_index,
+      predictor_numbers = paste(combo_list[[combo_index]], collapse = ", "),
+      has_hospitalization = 11L %in% combo_list[[combo_index]],
+
+      median_state_rmse = median(state_rmse_available$rmse),
+      n_states = nrow(state_rmse_available),
+      n_predictions = nrow(pred_tibble),
+
+      median_state_rmse_46 = median(state_rmse_46$rmse),
+      n_states_46 = nrow(state_rmse_46),
+      n_predictions_46 = nrow(pred_common_46)
+    )
+  })
+})
+```
+
+# Best model of each size, with and without hospital admissions
+
+```{r}
+best_of_each_size <- function(has_hosp) {
+  all_state_median_results %>%
+    dplyr::filter(has_hospitalization == has_hosp) %>%
+    dplyr::arrange(k, median_state_rmse_46, combo_index) %>%
+    dplyr::group_by(k) %>%
+    dplyr::slice(1) %>%
+    dplyr::ungroup()
+}
+
+best_state_median_with_hosp_46_by_k <- best_of_each_size(TRUE)
+best_state_median_no_hosp_46_by_k   <- best_of_each_size(FALSE)
+
+best_state_median_46_comparison <- dplyr::full_join(
+
+  best_state_median_with_hosp_46_by_k %>%
+    dplyr::transmute(
+      k,
+      minimum_rmse_with  = median_state_rmse_46,
+      index_with         = combo_index,
+      predictors_with    = predictor_numbers,
+      n_states_with      = n_states_46,
+      n_predictions_with = n_predictions_46
+    ),
+
+  best_state_median_no_hosp_46_by_k %>%
+    dplyr::transmute(
+      k,
+      minimum_rmse_without  = median_state_rmse_46,
+      index_without         = combo_index,
+      predictors_without    = predictor_numbers,
+      n_states_without      = n_states_46,
+      n_predictions_without = n_predictions_46
+    ),
+
+  by = "k"
+) %>%
+  dplyr::arrange(k)
+
+best_state_median_46_comparison %>%
+  dplyr::mutate(
+    minimum_rmse_with = sprintf("%.3f", minimum_rmse_with),
+    minimum_rmse_without = dplyr::if_else(
+      is.na(minimum_rmse_without),
+      NA_character_,
+      sprintf("%.3f", minimum_rmse_without)
+    )
+  ) %>%
+  print(n = Inf, width = Inf)
+```
+# Median state-level RMSE for every candidate model at each horizon
+
+```{r}
+compute_all_median_46 <- function(lag_suffix) {
+
+  purrr::map_dfr(1:12, function(k) {
+
+    object_name <- paste0("comb", k, "_median_vac.", lag_suffix)
+    if (!exists(object_name, envir = .GlobalEnv)) {
+      stop("Object not found: ", object_name)
+    }
+
+    pred_list  <- get(object_name, envir = .GlobalEnv)$y_predicted_new
+    combo_list <- combn(1:12, k, simplify = FALSE)
+
+    stopifnot(length(pred_list) == length(combo_list))
+
+    purrr::imap_dfr(pred_list, function(pred_tibble, combo_index) {
+
+      pred_common_46 <- pred_tibble %>%
+        dplyr::mutate(state = as.character(state)) %>%
+        dplyr::filter(!state %in% COMMON_EXCLUDE_STATES)
+
+      stopifnot(dplyr::n_distinct(pred_common_46$state) == 46)
+
+      state_rmse_46 <- pred_common_46 %>%
+        dplyr::group_by(state) %>%
+        dplyr::summarise(rmse = sqrt(mean((pred - obs)^2)), .groups = "drop")
+
+      tibble::tibble(
+        lag = lag_suffix,
+        k = k,
+        combo_index = combo_index,
+        predictor_numbers = paste(combo_list[[combo_index]], collapse = ", "),
+        has_hospitalization = 11L %in% combo_list[[combo_index]],
+        median_state_rmse_46 = median(state_rmse_46$rmse)
+      )
+    })
+  })
+}
+
+all_lag1_46 <- compute_all_median_46("lag1")
+all_lag2_46 <- compute_all_median_46("lag2")
+all_lag3_46 <- compute_all_median_46("lag3")
+```

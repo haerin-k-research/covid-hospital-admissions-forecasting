@@ -1,0 +1,654 @@
+---
+title: "Untitled"
+output: html_document
+date: "2026-08-23"
+---
+
+# Table S1
+
+```{r}
+library(dplyr)
+library(purrr)
+
+best_by_size <- function(all_df, has_hosp) {
+  all_df %>%
+    dplyr::filter(has_hospitalization == has_hosp) %>%
+    dplyr::group_by(k) %>%
+    dplyr::summarise(rmse = min(median_state_rmse_46), .groups = "drop") %>%
+    dplyr::arrange(k)
+}
+
+build_table_S1 <- function(has_hosp) {
+  purrr::reduce(
+    list(
+      best_by_size(all_lag1_46, has_hosp) %>% dplyr::rename(`1-week` = rmse),
+      best_by_size(all_lag2_46, has_hosp) %>% dplyr::rename(`2-week` = rmse),
+      best_by_size(all_lag3_46, has_hosp) %>% dplyr::rename(`3-week` = rmse)
+    ),
+    dplyr::left_join,
+    by = "k"
+  ) %>%
+    dplyr::mutate(dplyr::across(-k, ~ sprintf("%.3f", .x)))
+}
+
+table_S1_with    <- build_table_S1(TRUE)
+table_S1_without <- build_table_S1(FALSE)
+
+print(table_S1_with, n = Inf)
+print(table_S1_without, n = Inf)
+```
+
+# Table S3
+
+```{r}
+library(dplyr)
+
+ADMISSIONS_INDEX <- 11L
+lags <- c("lag1", "lag2", "lag3")
+
+results_by_lag <- setNames(
+  lapply(lags, function(lag) {
+    if (lag == "lag3") all_lag3_46 else compute_all_median_46(lag)
+  }),
+  lags
+)
+
+pick_best <- function(lag, include_hosp) {
+  results_by_lag[[lag]] %>%
+    dplyr::filter(has_hospitalization == include_hosp) %>%
+    dplyr::arrange(median_state_rmse_46, k, combo_index) %>%
+    dplyr::slice(1)
+}
+
+pick_hosp_only <- function(lag) {
+  results_by_lag[[lag]] %>%
+    dplyr::filter(k == 1, predictor_numbers == as.character(ADMISSIONS_INDEX)) %>%
+    dplyr::slice(1)
+}
+
+get_persistence_median46 <- function(lag, k, idx, h) {
+
+  model_pred <- get(paste0("comb", k, "_median_vac.", lag))$y_predicted_new[[idx]] %>%
+    dplyr::mutate(state = as.character(state), date = as.Date(date)) %>%
+    dplyr::filter(!state %in% COMMON_EXCLUDE_STATES) %>%
+    dplyr::select(state, date, obs)
+
+  persistence <- final_data %>%
+    dplyr::mutate(state = as.character(state), date = as.Date(date)) %>%
+    dplyr::filter(!state %in% COMMON_EXCLUDE_STATES) %>%
+    dplyr::arrange(state, date) %>%
+    dplyr::group_by(state) %>%
+    dplyr::mutate(persist_pred = dplyr::lag(Hospital.Admissions, n = h)) %>%
+    dplyr::ungroup() %>%
+    dplyr::select(state, date, persist_pred)
+
+  model_pred %>%
+    dplyr::inner_join(persistence, by = c("state", "date")) %>%
+    dplyr::filter(!is.na(persist_pred)) %>%
+    dplyr::group_by(state) %>%
+    dplyr::summarise(rmse = sqrt(mean((persist_pred - obs)^2)), .groups = "drop") %>%
+    dplyr::summarise(m = median(rmse)) %>%
+    dplyr::pull(m)
+}
+
+row_from <- function(picker) {
+  vapply(lags, function(lag) picker(lag)$median_state_rmse_46, numeric(1))
+}
+
+row_hosp_only    <- row_from(pick_hosp_only)
+row_best_with    <- row_from(function(lag) pick_best(lag, TRUE))
+row_best_without <- row_from(function(lag) pick_best(lag, FALSE))
+
+row_locf <- vapply(lags, function(lag) {
+  best <- pick_best(lag, TRUE)
+  get_persistence_median46(lag, best$k, best$combo_index,
+                           h = as.integer(sub("lag", "", lag)))
+}, numeric(1))
+
+table_s3 <- tibble::tibble(
+  Model = c(
+    "Naïve (LOCF)",
+    "Hospital admissions only",
+    "Best model including hospital admissions",
+    "Best model excluding hospital admissions"
+  ),
+  `1-week` = c(row_locf[["lag1"]], row_hosp_only[["lag1"]],
+               row_best_with[["lag1"]], row_best_without[["lag1"]]),
+  `2-week` = c(row_locf[["lag2"]], row_hosp_only[["lag2"]],
+               row_best_with[["lag2"]], row_best_without[["lag2"]]),
+  `3-week` = c(row_locf[["lag3"]], row_hosp_only[["lag3"]],
+               row_best_with[["lag3"]], row_best_without[["lag3"]])
+) %>%
+  dplyr::mutate(dplyr::across(where(is.numeric), ~ sprintf("%.3f", .x)))
+
+as.data.frame(table_s3)
+```
+
+
+# Table S5
+
+```{r}
+library(dplyr)
+library(purrr)
+library(tibble)
+
+source_list <- c(
+  "Wearing Masks", "Symptoms", "Symptoms in Community", "Outpatient Visits",
+  "Test Positivity", "Cases", "Deaths", "Vaccinations",
+  "Policy Index", "Climate", "Hospital Admissions", "ED Visits"
+)
+
+
+PREDICTOR_ABBR <- c(
+  "WM", "Sx", "SxC", "OV",
+  "TP", "Ca", "De", "Va",
+  "PI", "Cl", "HA", "ED"
+)
+
+SWITCH_AT <- 6L
+
+all_metrics <- purrr::map_dfr(1:12, function(k) {
+
+  pred_list <- get(paste0("comb", k, "_median_vac.lag3"))$y_predicted_new
+  stopifnot(length(pred_list) == choose(12, k))
+
+  purrr::imap_dfr(pred_list, function(pred_tbl, combo_index) {
+
+    d <- pred_tbl %>%
+      dplyr::mutate(state = as.character(state)) %>%
+      dplyr::filter(!state %in% COMMON_EXCLUDE_STATES)
+
+    stopifnot(dplyr::n_distinct(d$state) == 46L)
+
+    state_rmse <- d %>%
+      dplyr::group_by(state) %>%
+      dplyr::summarise(rmse = sqrt(mean((pred - obs)^2)), .groups = "drop")
+
+    tibble::tibble(
+      k = k,
+      combo_index = as.integer(combo_index),
+      median_rmse = median(state_rmse$rmse),
+      pooled_rmse = sqrt(mean((d$pred - d$obs)^2))
+    )
+  })
+})
+
+combo_label <- function(k, idx, abbr = TRUE) {
+
+  members <- as.integer(combn(12, k, simplify = FALSE)[[idx]])
+  nm <- if (abbr) PREDICTOR_ABBR else source_list
+
+  if (k <= SWITCH_AT) {
+    paste(nm[members], collapse = ", ")
+  } else {
+    excluded <- setdiff(1:12, members)
+    if (length(excluded) == 0) {
+      "all"
+    } else {
+      paste0("all except ", paste(nm[excluded], collapse = ", "))
+    }
+  }
+}
+
+best_by <- function(metric) {
+  all_metrics %>%
+    dplyr::group_by(k) %>%
+    dplyr::arrange(.data[[metric]], combo_index, .by_group = TRUE) %>%
+    dplyr::slice(1) %>%
+    dplyr::ungroup() %>%
+    dplyr::transmute(
+      k,
+      selected = purrr::map2_chr(k, combo_index, combo_label),
+      rmse = .data[[metric]]
+    )
+}
+
+rank_cor <- all_metrics %>%
+  dplyr::group_by(k) %>%
+  dplyr::summarise(
+    spearman = if (dplyr::n() > 2L) {
+      cor(median_rmse, pooled_rmse, method = "spearman")
+    } else {
+      NA_real_
+    },
+    .groups = "drop"
+  )
+
+table_s5 <- best_by("median_rmse") %>%
+  dplyr::rename(sel_median = selected, rmse_median = rmse) %>%
+  dplyr::left_join(
+    best_by("pooled_rmse") %>%
+      dplyr::rename(sel_pooled = selected, rmse_pooled = rmse),
+    by = "k"
+  ) %>%
+  dplyr::left_join(rank_cor, by = "k") %>%
+  dplyr::transmute(
+    `Model size` = k,
+    `Predictors selected by median RMSE` = sel_median,
+    `Median RMSE` = sprintf("%.3f", rmse_median),
+    `Predictors selected by pooled RMSE` = sel_pooled,
+    `Pooled RMSE` = sprintf("%.3f", rmse_pooled),
+    `Spearman rho` = ifelse(is.na(spearman), "-", sprintf("%.2f", spearman))
+  )
+
+for (i in seq_len(nrow(table_s5))) {
+  cat(sprintf(
+    "k=%-2s | median %s : %s\n       | pooled %s : %s\n       | Spearman rho = %s\n\n",
+    table_s5$`Model size`[i],
+    table_s5$`Median RMSE`[i],
+    table_s5$`Predictors selected by median RMSE`[i],
+    table_s5$`Pooled RMSE`[i],
+    table_s5$`Predictors selected by pooled RMSE`[i],
+    table_s5$`Spearman rho`[i]
+  ))
+}
+
+cat("Abbreviations: ",
+    paste(sprintf("%s = %s", PREDICTOR_ABBR, source_list), collapse = "; "),
+    "\n", sep = "")
+
+range(rank_cor$spearman, na.rm = TRUE)
+```
+
+
+# Table S6
+
+```{r}
+library(dplyr)
+library(purrr)
+
+
+NATIONAL_K   <- 6L
+NATIONAL_IDX <- 105L
+
+N_STATES_EXPECTED    <- 46L
+N_FORECASTS_EXPECTED <- 50L
+N_CANDIDATES         <- 4095L
+
+stopifnot(
+  identical(
+    as.integer(combn(12, NATIONAL_K, simplify = FALSE)[[NATIONAL_IDX]]),
+    c(1L, 2L, 4L, 5L, 11L, 12L)
+  )
+)
+
+all_state_rmse <- purrr::map_dfr(1:12, function(k) {
+
+  pred_list <- get(paste0("comb", k, "_median_vac.lag3"))$y_predicted_new
+  stopifnot(length(pred_list) == choose(12, k))
+
+  purrr::imap_dfr(pred_list, function(pred_tbl, combo_index) {
+    pred_tbl %>%
+      dplyr::mutate(state = as.character(state)) %>%
+      dplyr::filter(!state %in% COMMON_EXCLUDE_STATES) %>%
+      dplyr::group_by(state) %>%
+      dplyr::summarise(
+        rmse = sqrt(mean((pred - obs)^2)),
+        n_forecasts = dplyr::n(),
+        .groups = "drop"
+      ) %>%
+      dplyr::mutate(k = k, combo_index = as.integer(combo_index))
+  })
+})
+
+stopifnot(
+  nrow(dplyr::distinct(all_state_rmse, k, combo_index)) == N_CANDIDATES,
+  dplyr::n_distinct(all_state_rmse$state) == N_STATES_EXPECTED,
+  all(dplyr::count(all_state_rmse, k, combo_index, name = "n")$n == N_STATES_EXPECTED),
+  all(all_state_rmse$n_forecasts == N_FORECASTS_EXPECTED),
+  all(is.finite(all_state_rmse$rmse)),
+  all(all_state_rmse$rmse > 0)
+)
+
+national_state_rmse <- all_state_rmse %>%
+  dplyr::group_by(state) %>%
+  dplyr::mutate(rank_in_state = dplyr::min_rank(rmse)) %>%
+  dplyr::filter(k == NATIONAL_K, combo_index == NATIONAL_IDX) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(state, national_rmse = rmse, national_rank = rank_in_state)
+
+stopifnot(nrow(national_state_rmse) == N_STATES_EXPECTED)
+
+state_best <- all_state_rmse %>%
+  dplyr::group_by(state) %>%
+  dplyr::slice_min(order_by = rmse, n = 1, with_ties = FALSE) %>%
+  dplyr::ungroup() %>%
+  dplyr::transmute(
+    state,
+    best_k = k,
+    best_combo_index = combo_index,
+    state_best_rmse = rmse
+  )
+
+het <- national_state_rmse %>%
+  dplyr::left_join(state_best, by = "state") %>%
+  dplyr::mutate(
+    relative_improvement = 100 * (national_rmse - state_best_rmse) / national_rmse,
+    national_percentile = 100 * national_rank / N_CANDIDATES
+  ) %>%
+  dplyr::rowwise() %>%
+  dplyr::mutate(
+    best_predictor_indices = list(
+      as.integer(combn(12, best_k, simplify = FALSE)[[best_combo_index]])
+    ),
+    best_predictors = paste(source_list[best_predictor_indices], collapse = ", "),
+    best_has_admissions = 11L %in% best_predictor_indices
+  ) %>%
+  dplyr::ungroup() %>%
+  dplyr::arrange(state)
+
+cat(sprintf(
+  "Number of states                                 : %d\n",
+  nrow(het)
+))
+
+cat(sprintf(
+  "Median rank of national-best model               : %d / %s (top %.1f%%)\n",
+  as.integer(median(het$national_rank)),
+  format(N_CANDIDATES, big.mark = ","),
+  median(het$national_percentile)
+))
+
+cat(sprintf(
+  "Median RMSE of the national-best model           : %.3f\n",
+  median(het$national_rmse)
+))
+
+cat(sprintf(
+  "Median RMSE of the state-best models             : %.3f\n",
+  median(het$state_best_rmse)
+))
+
+cat(sprintf(
+  "Median percent reduction (state-best vs national): %.1f%% (IQR %.1f%%-%.1f%%)\n",
+  median(het$relative_improvement),
+  quantile(het$relative_improvement, 0.25),
+  quantile(het$relative_improvement, 0.75)
+))
+```
+
+# Table S7
+
+```{r}
+library(dplyr)
+
+parse_nums <- function(x) as.integer(strsplit(x, ",\\s*")[[1]])
+
+univariate <- all_lag3_46 %>%
+  dplyr::filter(k == 1) %>%
+  dplyr::mutate(
+    pred = as.integer(predictor_numbers),
+    name = source_list[pred]
+  ) %>%
+  dplyr::select(pred, name, individual = median_state_rmse_46)
+
+bivariate <- all_lag3_46 %>%
+  dplyr::filter(k == 2) %>%
+  dplyr::mutate(nums = lapply(predictor_numbers, parse_nums)) %>%
+  dplyr::filter(vapply(nums, function(v) 11L %in% v, logical(1))) %>%
+  dplyr::mutate(pred = vapply(nums, function(v) v[v != 11L], integer(1))) %>%
+  dplyr::select(pred, combined = median_state_rmse_46)
+
+# Hospital admissions has no bivariate counterpart
+table_s7 <- univariate %>%
+  dplyr::left_join(bivariate, by = "pred") %>%
+  dplyr::arrange(individual) %>%
+  dplyr::mutate(
+    individual = sprintf("%.3f", individual),
+    combined = ifelse(is.na(combined), "\u2013", sprintf("%.3f", combined))
+  )
+
+print(table_s7, n = Inf)
+```
+
+# Table S8
+
+```{r}
+library(dplyr)
+library(purrr)
+
+
+stopifnot(
+  identical(combn(12, 6, simplify = FALSE)[[105]], c(1L, 2L, 4L, 5L, 11L, 12L)),
+  identical(combn(12, 4, simplify = FALSE)[[103]], c(1L, 4L, 8L, 12L))
+)
+
+if (!exists("pred_with_final_46") || !exists("pred_without_final_46")) {
+
+  get_pred_46 <- function(k, idx) {
+    object_name <- paste0("comb", k, "_median_vac.lag3")
+    if (!exists(object_name, envir = .GlobalEnv)) {
+      stop("Object not found: ", object_name)
+    }
+    get(object_name, envir = .GlobalEnv)$y_predicted_new[[idx]] %>%
+      dplyr::transmute(
+        state = as.character(state), date = as.Date(date), obs, pred
+      ) %>%
+      dplyr::filter(!state %in% COMMON_EXCLUDE_STATES)
+  }
+
+  pred_with_final_46    <- get_pred_46(6, 105)
+  pred_without_final_46 <- get_pred_46(4, 103)
+}
+
+pred_compare <- pred_with_final_46 %>%
+  dplyr::transmute(state, date, obs_with = obs, pred_with = pred) %>%
+  dplyr::inner_join(
+    pred_without_final_46 %>%
+      dplyr::transmute(state, date, obs_without = obs, pred_without = pred),
+    by = c("state", "date")
+  )
+
+prediction_count_check <- pred_compare %>%
+  dplyr::count(state, name = "n_predictions")
+
+stopifnot(
+  nrow(pred_compare) == 2300,
+  dplyr::n_distinct(pred_compare$state) == 46,
+  all(prediction_count_check$n_predictions == 50),
+  isTRUE(all.equal(pred_compare$obs_with, pred_compare$obs_without, tolerance = 0)),
+  all(is.finite(pred_compare$obs_with)),
+  all(is.finite(pred_compare$pred_with)),
+  all(is.finite(pred_compare$pred_without))
+)
+
+pred_compare <- pred_compare %>%
+  dplyr::transmute(state, date, obs = obs_with, pred_with, pred_without)
+```
+
+```{r}
+peak_windows <- tibble::tibble(
+  peak  = c("Delta", "Omicron"),
+  start = as.Date(c("2021-07-25", "2021-12-05")),
+  end   = as.Date(c("2021-11-28", "2022-02-27"))
+)
+
+compute_peak_errors <- function(df_state, peak_name, start_date, end_date) {
+
+  d <- df_state %>%
+    dplyr::filter(date >= start_date, date <= end_date) %>%
+    dplyr::arrange(date)
+
+  if (nrow(d) == 0) {
+    stop("No observations in peak window for state ", unique(df_state$state))
+  }
+
+  obs_i     <- which.max(d$obs)
+  with_i    <- which.max(d$pred_with)
+  without_i <- which.max(d$pred_without)
+
+  obs_peak <- d$obs[obs_i]
+  obs_date <- d$date[obs_i]
+
+  if (!is.finite(obs_peak) || obs_peak <= 0) {
+    stop("Observed peak is non-positive or non-finite for state ",
+         unique(d$state), ", peak ", peak_name)
+  }
+
+  tibble::tibble(
+    state = unique(d$state),
+    peak = peak_name,
+
+    obs_peak_date = obs_date,
+    obs_peak_value = obs_peak,
+
+    pred_peak_date_with = d$date[with_i],
+    pred_peak_value_with = d$pred_with[with_i],
+    pred_peak_date_without = d$date[without_i],
+    pred_peak_value_without = d$pred_without[without_i],
+
+    mag_err_with_pct = 100 * (d$pred_with[with_i] - obs_peak) / obs_peak,
+    mag_err_without_pct = 100 * (d$pred_without[without_i] - obs_peak) / obs_peak,
+    timing_err_with_wk = as.numeric(d$date[with_i] - obs_date) / 7,
+    timing_err_without_wk = as.numeric(d$date[without_i] - obs_date) / 7,
+
+    n_obs_peak_ties = sum(d$obs == max(d$obs)),
+    n_with_peak_ties = sum(d$pred_with == max(d$pred_with)),
+    n_without_peak_ties = sum(d$pred_without == max(d$pred_without))
+  )
+}
+
+peak_results <- purrr::map_dfr(sort(unique(pred_compare$state)), function(st) {
+
+  df_state <- pred_compare %>% dplyr::filter(state == st)
+
+  purrr::pmap_dfr(peak_windows, function(peak, start, end) {
+    compute_peak_errors(df_state, peak, start, end)
+  })
+}) %>%
+  dplyr::mutate(
+    abs_mag_with = abs(mag_err_with_pct),
+    abs_mag_without = abs(mag_err_without_pct),
+    abs_tim_with = abs(timing_err_with_wk),
+    abs_tim_without = abs(timing_err_without_wk)
+  )
+
+state_peak_check <- peak_results %>% dplyr::count(state, name = "n_peaks")
+
+stopifnot(
+  nrow(peak_results) == 92,
+  dplyr::n_distinct(peak_results$state) == 46,
+  all(state_peak_check$n_peaks == 2),
+  all(peak_results$obs_peak_value > 0),
+  all(is.finite(peak_results$mag_err_with_pct)),
+  all(is.finite(peak_results$mag_err_without_pct)),
+  all(is.finite(peak_results$timing_err_with_wk)),
+  all(is.finite(peak_results$timing_err_without_wk))
+)
+```
+
+```{r}
+summarise_peak_errors <- function(df) {
+  df %>%
+    dplyr::summarise(
+      med_absmag_with = median(abs_mag_with),
+      q25_absmag_with = quantile(abs_mag_with, 0.25),
+      q75_absmag_with = quantile(abs_mag_with, 0.75),
+      med_absmag_without = median(abs_mag_without),
+      q25_absmag_without = quantile(abs_mag_without, 0.25),
+      q75_absmag_without = quantile(abs_mag_without, 0.75),
+      med_abstim_with = median(abs_tim_with),
+      q25_abstim_with = quantile(abs_tim_with, 0.25),
+      q75_abstim_with = quantile(abs_tim_with, 0.75),
+      med_abstim_without = median(abs_tim_without),
+      q25_abstim_without = quantile(abs_tim_without, 0.25),
+      q75_abstim_without = quantile(abs_tim_without, 0.75),
+      .groups = "drop"
+    )
+}
+
+fmt <- function(med, lo, hi, digits) {
+  sprintf(paste0("%.", digits, "f (%.1f\u2013%.1f)"), med, lo, hi)
+}
+
+table_s8 <- peak_results %>%
+  dplyr::group_by(peak) %>%
+  summarise_peak_errors() %>%
+  dplyr::transmute(
+    Wave = peak,
+    `Amplitude, including` = fmt(med_absmag_with, q25_absmag_with, q75_absmag_with, 1),
+    `Amplitude, excluding` = fmt(med_absmag_without, q25_absmag_without, q75_absmag_without, 1),
+    `Timing, including` = fmt(med_abstim_with, q25_abstim_with, q75_abstim_with, 0),
+    `Timing, excluding` = fmt(med_abstim_without, q25_abstim_without, q75_abstim_without, 0)
+  )
+
+as.data.frame(table_s8)
+```
+
+# Table S9
+
+```{r}
+library(dplyr)
+library(purrr)
+library(tibble)
+
+
+exclude_ed_states <- c("MN", "MO", "OK")
+lags_to_check <- 0:3
+
+safe_cor <- function(x, y) {
+  ok <- complete.cases(x, y)
+  if (sum(ok) < 3L || sd(x[ok]) == 0 || sd(y[ok]) == 0) return(NA_real_)
+  cor(x[ok], y[ok], method = "pearson")
+}
+
+ed_hosp_df <- final_data %>%
+  dplyr::filter(!state %in% exclude_ed_states) %>%
+  dplyr::transmute(
+    state = as.character(state),
+    date = as.Date(date),
+    ed = as.numeric(ED.visits),
+    hosp = as.numeric(Hospital.Admissions)
+  ) %>%
+  dplyr::arrange(state, date)
+
+stopifnot(
+  dplyr::n_distinct(ed_hosp_df$state) == 47L,
+  dplyr::n_distinct(ed_hosp_df$date) == 70L
+)
+
+calc_bidirectional_cor <- function(df, lags) {
+
+  df <- df %>% dplyr::arrange(date)
+
+  purrr::map_dfr(lags, function(L) {
+    tibble::tibble(
+      lag_weeks = L,
+      ed_to_hosp = safe_cor(df$ed, dplyr::lead(df$hosp, n = L)),
+      hosp_to_ed = safe_cor(df$hosp, dplyr::lead(df$ed, n = L))
+    )
+  })
+}
+
+bidirectional_cor_by_state <- ed_hosp_df %>%
+  dplyr::group_by(state) %>%
+  dplyr::group_modify(~ calc_bidirectional_cor(.x, lags_to_check)) %>%
+  dplyr::ungroup()
+
+stopifnot(nrow(bidirectional_cor_by_state) == 47L * length(lags_to_check))
+
+table_s9 <- bidirectional_cor_by_state %>%
+  dplyr::group_by(lag_weeks) %>%
+  dplyr::summarise(
+    n_states = sum(!is.na(ed_to_hosp) & !is.na(hosp_to_ed)),
+    median_ed_to_hosp = median(ed_to_hosp, na.rm = TRUE),
+    q1_ed_to_hosp = quantile(ed_to_hosp, 0.25, na.rm = TRUE),
+    q3_ed_to_hosp = quantile(ed_to_hosp, 0.75, na.rm = TRUE),
+    median_hosp_to_ed = median(hosp_to_ed, na.rm = TRUE),
+    q1_hosp_to_ed = quantile(hosp_to_ed, 0.25, na.rm = TRUE),
+    q3_hosp_to_ed = quantile(hosp_to_ed, 0.75, na.rm = TRUE),
+    median_difference = median(ed_to_hosp - hosp_to_ed, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  dplyr::transmute(
+    `Lag (weeks)` = lag_weeks,
+    `N states` = n_states,
+    `ED to Hosp median r` = sprintf("%.3f", median_ed_to_hosp),
+    `ED to Hosp IQR` = sprintf("[%.3f, %.3f]", q1_ed_to_hosp, q3_ed_to_hosp),
+    `Hosp to ED median r` = sprintf("%.3f", median_hosp_to_ed),
+    `Hosp to ED IQR` = sprintf("[%.3f, %.3f]", q1_hosp_to_ed, q3_hosp_to_ed),
+    `Median difference` = sprintf("%.3f", median_difference)
+  )
+
+as.data.frame(table_s9)
+```
