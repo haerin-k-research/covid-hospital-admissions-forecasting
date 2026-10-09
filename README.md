@@ -15,3 +15,5 @@ Code for "The Value of Hospital Admission Data for Forecasting Healthcare Burden
 2. `bootstrap_github.Rmd`
 3. `figures_github.Rmd`
 4. `tables_github.Rmd`
+
+Data sources and documentation are available in [README_data_sources.md](README_data_sources.md).
