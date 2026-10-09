@@ -21,6 +21,8 @@ as used in the analysis files.
 | `Hospital.Admissions` | Hospital admissions (forecast target and predictor) | HHS Protect, accessed through COVIDcast | [HHS hospital admissions data and documentation](https://cmu-delphi.github.io/delphi-epidata/api/covidcast-signals/hhs.html#department-of-health--human-services-hospitalizations) |
 | `ED.visits` | ED visits | CDC National Syndromic Surveillance Program (NSSP) | [CDC COVID-19 surveillance page cited in the manuscript](https://www.cdc.gov/covid/php/surveillance/index.html) |
 
+**Vaccination variable:** The column `Distributed` contains weekly new COVID-19 vaccine doses administered per 100,000 population. The original column name is retained for compatibility with the analysis code.
+
 Additional COVIDcast resources are available from the [Delphi COVIDcast website](https://delphi.cmu.edu/covidcast/)
 and the [Delphi Epidata documentation](https://cmu-delphi.github.io/delphi-epidata/api/covidcast_signals.html).
 
