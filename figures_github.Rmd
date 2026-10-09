@@ -1107,7 +1107,7 @@ pred_labs <- c(
   Wearing.Masks         = "bold('Wearing masks (%)')",
   Doctor.Visits         = "bold('Outpatient visits (per 100k)')",
   Symtoms               = "bold('Symptoms (%)')",
-  Distributed           = "bold('Vaccines distributed (per 100k)')",
+  Distributed           = "bold('Vaccines administered (per 100k)')",
   Symtoms.in.community  = "bold('Symptoms in community (%)')",
   Deaths                = "bold('Deaths (per 100k)')",
   Cases                 = "bold('Cases (per 100k)')",
