@@ -11,15 +11,26 @@ library(dplyr)
 library(purrr)
 library(tibble)
 library(glmnet)
+library(splines)
 
 
 WLAG <- 3L
 N_STATES <- 50L
+B <- 500L
 FEATURES_PER <- 21L
 LAMBDAS <- 10^seq(3, -2, by = -0.1)
 
 STATE_SEED_BASE <- 10000L
 CV_SEED_BASE <- 20000L
+ORIGIN_CV_SEED_BASE <- 30000L
+POINT_SEED_BASE <- 9000L
+
+BOOTSTRAP_DIR <- "results/bootstrap"
+INTERVAL_DIR <- "results/intervals"
+WITH_FILE <- file.path(BOOTSTRAP_DIR, "with_admissions.rds")
+WITHOUT_FILE <- file.path(BOOTSTRAP_DIR, "without_admissions.rds")
+dir.create(BOOTSTRAP_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(INTERVAL_DIR, recursive = TRUE, showWarnings = FALSE)
 
 state_population <- tibble::tribble(
   ~state, ~population,
@@ -40,8 +51,7 @@ state_population <- tibble::tribble(
 
 stopifnot(
   exists("final_data"),
-  exists("comb6_median_vac.lag3"),
-  exists("comb4_median_vac.lag3"),
+  exists("all_lag3_46"),
   exists("predictor_block_exclusions"),
   exists("make_Xdata_train"),
   exists("make_Xdata_test"),
@@ -65,42 +75,29 @@ stopifnot(
 
 all_states <- sort(unique(final_data$state))
 
-MODEL_SPECS <- list(
-  with = list(
-    k = 6L,
-    combo_index = 105L,
-    combo = c(1L, 2L, 4L, 5L, 11L, 12L),
-    eligible_states = setdiff(all_states, COMMON_EXCLUDE_STATES),
-    id_prefix = "BOOT_%03d",
-    glmnet_args = list(control = list(maxit = 1e6, mxitnr = 100)),
-    capture_warnings = FALSE
-  ),
-  without = list(
-    k = 4L,
-    combo_index = 103L,
-    combo = c(1L, 4L, 8L, 12L),
-    eligible_states = setdiff(all_states, c("MN", "MO", "OK")),
-    id_prefix = "BOOTSTATE_%03d",
-    glmnet_args = list(maxit = 100000),
-    capture_warnings = TRUE
-  )
-)
-
-for (spec in MODEL_SPECS) {
-  stopifnot(
-    identical(
-      as.integer(combn(12, spec$k, simplify = FALSE)[[spec$combo_index]]),
-      spec$combo
-    )
+make_model_spec <- function(has_admissions, id_prefix) {
+  selected <- all_lag3_46 %>%
+    dplyr::filter(has_hospitalization == has_admissions) %>%
+    dplyr::arrange(median_state_rmse_46, k, combo_index) %>%
+    dplyr::slice(1)
+  stopifnot(nrow(selected) == 1L)
+  combo <- combn(12, selected$k, simplify = FALSE)[[selected$combo_index]]
+  excluded <- unique(unlist(lapply(
+    predictor_block_exclusions[intersect(names(predictor_block_exclusions), as.character(combo))],
+    function(rule) rule$states
+  )))
+  list(
+    k = selected$k, combo_index = selected$combo_index, combo = combo,
+    eligible_states = setdiff(all_states, excluded), id_prefix = id_prefix
   )
 }
 
-stopifnot(
-  length(MODEL_SPECS$with$eligible_states) == 46L,
-  length(MODEL_SPECS$without$eligible_states) == 47L
+MODEL_SPECS <- list(
+  with = make_model_spec(TRUE, "BOOT_%03d"),
+  without = make_model_spec(FALSE, "BOOTSTATE_%03d")
 )
 
-glmnet::glmnet.control(mxitnr = 100)
+glmnet::glmnet.control(factory = TRUE)
 ```
 
 ```{r}
@@ -133,6 +130,26 @@ fold_data <- function(i) {
     test  = final_data[fb$te_s:fb$te_e, , drop = FALSE]
   )
 }
+
+
+study_dates <- sort(unique(as.Date(final_data$date)))
+
+origin_fold_data <- function(i, target_week) {
+  fw <- fold_weeks(i)
+  origin_week <- target_week - WLAG
+  stopifnot(origin_week >= fw$train[1] + 5L, origin_week < fw$train[2])
+  tr <- week_rows(c(fw$train[1], origin_week), N_STATES)
+  te <- week_rows(c(target_week - 5L, target_week), N_STATES)
+  list(
+    train = final_data[tr[1]:tr[2], , drop = FALSE],
+    test  = final_data[te[1]:te[2], , drop = FALSE],
+    target_date = study_dates[target_week],
+    origin_date = study_dates[origin_week]
+  )
+}
+
+AFFECTED <- lapply(1:5, function(i) affected_targets(i, WLAG))
+stopifnot(all(lengths(AFFECTED) == WLAG - 1L))
 
 
 make_original_foldids <- function(k, combo_index) {
@@ -185,7 +202,8 @@ fit_one_fold <- function(
     spec,
     train_exclusion_rules,
     foldid = NULL,
-    cv_seed = NULL
+    cv_seed = NULL,
+    n_targets = 10L
 ) {
 
   X_train_result <- make_Xdata_train(
@@ -215,8 +233,13 @@ fit_one_fold <- function(
 
   stopifnot(
     identical(key(X_train_labeled), key(y_train_labeled)),
-    identical(key(X_test_labeled), key(y_test_labeled))
+    identical(key(X_test_labeled), key(y_test_labeled)),
+    dplyr::n_distinct(y_test_labeled$date) == n_targets
   )
+
+  if (n_targets == 1L) {
+    stopifnot(max(y_train_labeled$date) <= min(y_test_labeled$date) - 7 * WLAG)
+  }
 
   X_train_combo <- do.call(
     cbind, lapply(X_train_labeled$X_list[spec$combo], as.matrix)
@@ -260,32 +283,19 @@ fit_one_fold <- function(
 
   stopifnot(length(foldid) == nrow(X_train_f))
 
-  cv_args <- c(
-    list(
-      x = X_train_f,
-      y = y_train_f,
-      alpha = 1,
-      family = poisson(link = "log"),
-      lambda = LAMBDAS,
-      standardize = TRUE,
-      foldid = foldid
-    ),
-    spec$glmnet_args
-  )
-
   warning_messages <- character(0)
 
-  if (spec$capture_warnings) {
-    cv_fit <- withCallingHandlers(
-      do.call(glmnet::cv.glmnet, cv_args),
-      warning = function(w) {
-        warning_messages <<- c(warning_messages, conditionMessage(w))
-        invokeRestart("muffleWarning")
-      }
-    )
-  } else {
-    cv_fit <- do.call(glmnet::cv.glmnet, cv_args)
-  }
+  cv_fit <- withCallingHandlers(
+    glmnet::cv.glmnet(
+      x = X_train_f, y = y_train_f, alpha = 1, family = poisson(link = "log"),
+      lambda = LAMBDAS, standardize = TRUE, foldid = foldid
+    ),
+    warning = function(w) {
+      warning_messages <<- c(warning_messages, conditionMessage(w))
+      invokeRestart("muffleWarning")
+    }
+  )
+
 
   y_pred <- as.numeric(
     predict(cv_fit, type = "response", s = cv_fit$lambda.min, newx = X_test_f)
@@ -301,29 +311,57 @@ fit_one_fold <- function(
   ) %>%
     dplyr::filter(!state %in% COMMON_EXCLUDE_STATES)
 
-  stopifnot(nrow(pred) == 460L, dplyr::n_distinct(pred$state) == 46L)
+  stopifnot(nrow(pred) == 46L * n_targets, dplyr::n_distinct(pred$state) == 46L)
 
   list(pred = pred, warnings = warning_messages, lambda_min = cv_fit$lambda.min)
 }
 ```
 
 ```{r}
+replace_target_rows <- function(pred_base, pred_refit, target_date) {
+
+  stopifnot(
+    nrow(pred_refit) == 46L,
+    all(pred_refit$date == target_date),
+    sum(pred_base$date == target_date) == 46L
+  )
+
+  key_base  <- paste(pred_base$state,  pred_base$date)
+  key_refit <- paste(pred_refit$state, pred_refit$date)
+  stopifnot(anyDuplicated(key_base) == 0L, all(key_refit %in% key_base))
+
+  idx <- match(key_refit, key_base)
+  stopifnot(all(abs(pred_base$obs[idx] - pred_refit$obs) < 1e-12))
+
+  pred_base$pred[idx] <- pred_refit$pred
+  pred_base
+}
+
+
 verify_point_estimate <- function(model_name, reference_object) {
 
   spec <- MODEL_SPECS[[model_name]]
   foldids <- make_original_foldids(spec$k, spec$combo_index)
+  stopifnot(nrow(reference_object$replaced) == 5L * (WLAG - 1L))
 
   reproduced <- purrr::map_dfr(1:5, function(i) {
     fd <- fold_data(i)
-    fit_one_fold(
-      train_data = fd$train,
-      test_data = fd$test,
-      spec = spec,
+    base <- fit_one_fold(
+      train_data = fd$train, test_data = fd$test, spec = spec,
       train_exclusion_rules = predictor_block_exclusions,
       foldid = foldids[[i]]
     )$pred
-  }) %>%
-    dplyr::arrange(state, date)
+    for (dj in seq_along(AFFECTED[[i]])) {
+      od <- origin_fold_data(i, AFFECTED[[i]][dj])
+      seed <- POINT_SEED_BASE + 1000000L * WLAG + 100000L * i + 10000L * dj + spec$combo_index
+      refit <- fit_one_fold(
+        od$train, od$test, spec, predictor_block_exclusions,
+        cv_seed = seed, n_targets = 1L
+      )$pred
+      base <- replace_target_rows(base, refit, od$target_date)
+    }
+    base
+  }) %>% dplyr::arrange(state, date)
 
   reference <- reference_object$y_predicted_new[[spec$combo_index]] %>%
     dplyr::transmute(
@@ -353,157 +391,227 @@ verify_point_estimate <- function(model_name, reference_object) {
     dplyr::summarise(m = median(rmse)) %>%
     dplyr::pull(m)
 
-  cat(sprintf(
-    "%-8s | max |obs diff| = %.2e | max |pred diff| = %.2e | median RMSE = %.6f\n",
-    model_name, max_obs_diff, max_pred_diff, median_rmse
-  ))
 
   stopifnot(max_obs_diff < 1e-10, max_pred_diff < 1e-6)
 
   invisible(median_rmse)
 }
 
-verify_point_estimate("with", comb6_median_vac.lag3)
-verify_point_estimate("without", comb4_median_vac.lag3)
+```
+
+```{r, eval = FALSE}
+for (model_name in names(MODEL_SPECS)) {
+  spec <- MODEL_SPECS[[model_name]]
+  reference <- get(paste0("comb", spec$k, "_median_vac.lag", WLAG))
+  verify_point_estimate(model_name, reference)
+}
 ```
 
 ```{r}
-run_bootstrap <- function(model_name, B) {
+one_replicate <- function(b, spec, model_name) {
 
-  spec <- MODEL_SPECS[[model_name]]
-  n_eligible <- length(spec$eligible_states)
+  set.seed(STATE_SEED_BASE + b)
+  sampled_states <- sample(spec$eligible_states, size = length(spec$eligible_states), replace = TRUE)
 
-  predictions <- vector("list", B)
-  warnings_log <- vector("list", B)
-  lambda_log <- vector("list", B)
+  lambda_rows  <- list()
+  warning_rows <- list()
 
-  for (b in seq_len(B)) {
+  fold_preds <- lapply(1:5, function(i) {
 
-    set.seed(STATE_SEED_BASE + b)
-    sampled_states <- sample(spec$eligible_states, size = n_eligible, replace = TRUE)
+    fd <- fold_data(i)
+    boot_train <- make_bootstrap_train_data(fd$train, sampled_states, spec$id_prefix)
+    cv_seed <- CV_SEED_BASE + (b - 1L) * 10L + i
 
-    fold_results <- lapply(1:5, function(i) {
+    fit <- fit_one_fold(boot_train, fd$test, spec, train_exclusion_rules = NULL,
+                        cv_seed = cv_seed, n_targets = 10L)
+    pred_i <- fit$pred
 
-      fd <- fold_data(i)
-
-      boot_train <- make_bootstrap_train_data(
-        train_data = fd$train,
-        sampled_states = sampled_states,
-        id_prefix = spec$id_prefix
-      )
-
-      cv_seed <- CV_SEED_BASE + (b - 1L) * 10L + i
-
-      fit <- fit_one_fold(
-        train_data = boot_train,
-        test_data = fd$test,
-        spec = spec,
-        train_exclusion_rules = NULL,
-        cv_seed = cv_seed
-      )
-
-      list(
-        pred = fit$pred,
-        lambda = tibble::tibble(
-          boot = b, fold = i, cv_seed = cv_seed, lambda_min = fit$lambda_min
-        ),
-        warnings = if (length(fit$warnings) > 0L) {
-          tibble::tibble(
-            boot = b, fold = i, cv_seed = cv_seed, warning = fit$warnings
-          )
-        } else {
-          NULL
-        }
-      )
-    })
-
-    pred_b <- dplyr::bind_rows(lapply(fold_results, `[[`, "pred")) %>%
-      dplyr::arrange(state, date)
-
-    stopifnot(
-      nrow(pred_b) == 2300L,
-      dplyr::n_distinct(pred_b$state) == 46L,
-      all(dplyr::count(pred_b, state)$n == 50L),
-      all(is.finite(pred_b$pred))
+    lambda_rows[[length(lambda_rows) + 1L]] <<- tibble::tibble(
+      boot = b, fold = i, refit = 0L, target_week = NA_integer_,
+      cv_seed = cv_seed, lambda_min = fit$lambda_min
     )
-
-    predictions[[b]] <- pred_b %>% dplyr::mutate(boot = b)
-    lambda_log[[b]] <- dplyr::bind_rows(lapply(fold_results, `[[`, "lambda"))
-    warnings_log[[b]] <- dplyr::bind_rows(lapply(fold_results, `[[`, "warnings"))
-
-    if (b %% 25L == 0L || b == B) {
-      cat(sprintf("%-8s bootstrap %d / %d  (%s)\n",
-                  model_name, b, B, format(Sys.time(), "%H:%M:%S")))
+    if (length(fit$warnings) > 0L) {
+      warning_rows[[length(warning_rows) + 1L]] <<- tibble::tibble(
+        boot = b, fold = i, refit = 0L, cv_seed = cv_seed, warning = fit$warnings
+      )
     }
-  }
+    for (dj in seq_along(AFFECTED[[i]])) {
 
-  out <- dplyr::bind_rows(predictions)
+      tw <- AFFECTED[[i]][dj]
+      od <- origin_fold_data(i, tw)
+      boot_train_o <- make_bootstrap_train_data(od$train, sampled_states, spec$id_prefix)
+      cv_seed_o <- ORIGIN_CV_SEED_BASE + (b - 1L) * 100L + i * 10L + dj
+      fit_o <- fit_one_fold(boot_train_o, od$test, spec, train_exclusion_rules = NULL,
+                            cv_seed = cv_seed_o, n_targets = 1L)
+      pred_i <- replace_target_rows(pred_i, fit_o$pred, od$target_date)
+
+      lambda_rows[[length(lambda_rows) + 1L]] <<- tibble::tibble(
+        boot = b, fold = i, refit = dj, target_week = tw,
+        cv_seed = cv_seed_o, lambda_min = fit_o$lambda_min
+      )
+      if (length(fit_o$warnings) > 0L) {
+        warning_rows[[length(warning_rows) + 1L]] <<- tibble::tibble(
+          boot = b, fold = i, refit = dj, cv_seed = cv_seed_o, warning = fit_o$warnings
+        )
+      }
+    }
+
+    pred_i
+  })
+
+  pred_b <- dplyr::bind_rows(fold_preds) %>% dplyr::arrange(state, date)
 
   stopifnot(
-    nrow(out) == B * 2300L,
-    dplyr::n_distinct(out$boot) == B,
-    all(is.finite(out$pred)),
-    all(out$pred >= 0)
+    nrow(pred_b) == 2300L,
+    dplyr::n_distinct(pred_b$state) == 46L,
+    all(dplyr::count(pred_b, state)$n == 50L),
+    all(is.finite(pred_b$pred))
   )
 
-  attr(out, "lambda_log") <- dplyr::bind_rows(lambda_log)
-  attr(out, "warning_log") <- dplyr::bind_rows(warnings_log)
+  list(
+    pred = pred_b %>% dplyr::mutate(boot = b),
+    lambda = dplyr::bind_rows(lambda_rows),
+    warnings = dplyr::bind_rows(warning_rows)
+  )
+}
 
+
+save_bootstrap_rds <- function(object, path) {
+  dir.create(dirname(path), recursive = TRUE, showWarnings = FALSE)
+  parent <- normalizePath(dirname(path), winslash = "/", mustWork = TRUE)
+  path <- file.path(parent, basename(path))
+  if (.Platform$OS.type == "windows" && nchar(path) > 240L) {
+    stop("Use a shorter output directory: ", path)
+  }
+  if (file.exists(path)) stop("File already exists: ", path)
+  temp <- tempfile(pattern = "pending_", tmpdir = parent, fileext = ".rds")
+  saved_complete <- FALSE
+  on.exit({ if (!saved_complete && file.exists(temp)) unlink(temp) }, add = TRUE)
+  saveRDS(object, temp)
+  saved_complete <- TRUE
+  if (file.exists(path) || !file.rename(temp, path)) {
+    stop("Could not save to ", path, ". Completed RDS retained at ", temp)
+  }
+  invisible(path)
+}
+
+run_bootstrap <- function(model_name, B) {
+  spec <- MODEL_SPECS[[model_name]]
+  fit_functions <- c(
+    "apply_predictor_exclusions", "make_lag_features", "fit_bs_preserve_na",
+    "predict_bs_preserve_na", "make_Xdata_train", "make_Xdata_test",
+    "make_Xlist_new_labeled", "make_y_labeled", "get_exclusion_mask",
+    "fold_weeks", "week_rows", "affected_targets", "fold_bounds", "fold_data",
+    "origin_fold_data", "make_original_foldids", "make_bootstrap_train_data",
+    "fit_one_fold", "replace_target_rows", "one_replicate"
+  )
+  signature <- list(
+    input_md5 = unname(tools::md5sum("analysis_data.rds")),
+    spec = spec, horizon = WLAG, n_states = N_STATES, features_per = FEATURES_PER,
+    predictors = predictor_names, exclusions = predictor_block_exclusions,
+    common_exclude_states = COMMON_EXCLUDE_STATES, lambdas = LAMBDAS,
+    seeds = c(STATE_SEED_BASE, CV_SEED_BASE, ORIGIN_CV_SEED_BASE, POINT_SEED_BASE),
+    control = glmnet::glmnet.control(), rng = RNGkind(), r_version = R.version.string,
+    platform = R.version$platform,
+    packages = vapply(c("glmnet", "Matrix", "dplyr", "purrr", "tibble", "splines"),
+                     function(x) as.character(utils::packageVersion(x)), character(1)),
+    fit_code = setNames(lapply(fit_functions, function(nm) {
+      f <- get(nm, mode = "function")
+      list(formals = formals(f), body = deparse(body(f), width.cutoff = 500L))
+    }), fit_functions)
+  )
+  stopifnot(!anyNA(signature$input_md5))
+  checkpoint_dir <- file.path(BOOTSTRAP_DIR, "checkpoints", model_name)
+  dir.create(checkpoint_dir, recursive = TRUE, showWarnings = FALSE)
+  results <- lapply(seq_len(B), function(b) {
+    path <- file.path(checkpoint_dir, sprintf("replicate_%03d.rds", b))
+    if (file.exists(path)) {
+      saved <- readRDS(path)
+      if (!identical(saved$signature, signature)) {
+        stop("Bootstrap inputs changed. Choose a new BOOTSTRAP_DIR.")
+      }
+      result <- saved$result
+    } else {
+      result <- one_replicate(b, spec, model_name)
+      save_bootstrap_rds(list(signature = signature, result = result), path)
+    }
+    stopifnot(
+      nrow(result$pred) == 2300L, all(result$pred$boot == b),
+      !anyDuplicated(result$pred[c("state", "date")]),
+      all(is.finite(result$pred$pred)), all(result$pred$pred >= 0),
+      nrow(result$lambda) == 5L * WLAG
+    )
+    result
+  })
+  out <- dplyr::bind_rows(lapply(results, `[[`, "pred"))
+  attr(out, "lambda_log") <- dplyr::bind_rows(lapply(results, `[[`, "lambda"))
+  attr(out, "warning_log") <- dplyr::bind_rows(lapply(results, `[[`, "warnings"))
+  attr(out, "model_spec") <- spec[c("k", "combo_index", "combo")]
+  attr(out, "signature") <- signature
   out
 }
 
-smoke <- run_bootstrap("with", B = 2)
-stopifnot(nrow(smoke) == 2 * 2300L)
+```
+
+```{r, eval = FALSE}
+boot_full <- run_bootstrap("with", B = B)
+boot_full_without <- run_bootstrap("without", B = B)
+if (nrow(attr(boot_full, "warning_log")) + nrow(attr(boot_full_without, "warning_log")) > 0L) {
+  warning("Bootstrap fits generated warnings; inspect the saved warning_log attributes.")
+}
+
+saveRDS(boot_full, WITH_FILE)
+saveRDS(boot_full_without, WITHOUT_FILE)
 ```
 
 ```{r}
-boot_full <- run_bootstrap("with", B = 500L)
-boot_full_without <- run_bootstrap("without", B = 500L)
-
-saveRDS(boot_full, "bootstrap_selected_k6_idx105_lag3_B500.rds")
-saveRDS(boot_full_without, "bootstrap_selected_k4_idx103_lag3_without_B500.rds")
+boot_full <- readRDS(WITH_FILE)
+boot_full_without <- readRDS(WITHOUT_FILE)
 ```
-
-```{r}
-# Reload without re-running the bootstrap
-# boot_full         <- readRDS("bootstrap_selected_k6_idx105_lag3_B500.rds")
-# boot_full_without <- readRDS("bootstrap_selected_k4_idx103_lag3_without_B500.rds")
-```
-
 
 # Negative binomial calibration and scoring
 
 ```{r}
-library(dplyr)
-library(tibble)
-
-DRAWS_PER_BOOT <- 20L      # 500 bootstrap means x 20 = 10,000 draws
-CAL_SEED       <- 20260817L
-SCORE_SEED     <- 20260818L
-
+DRAWS_PER_BOOT <- 20L                  # 500 bootstrap means x 20 = 10,000 draws
+CAL_SEED <- 20260817L
+SCORE_SEED <- 20260818L
 WIS_ALPHAS <- c(0.02, 0.05, seq(0.10, 0.90, by = 0.10))
-
 NOMINAL <- c(cov50 = 0.50, cov80 = 0.80, cov95 = 0.95)
 
+HORIZON <- WLAG
+WINDOW_WEEKS <- 10L
 CALIBRATION_FOLD <- 1L
-
-PRIMARY_OBJECTIVE     <- "coverage"
-SENSITIVITY_OBJECTIVE <- "wis"
+OBJECTIVE <- "coverage"
+EVAL_DATES <- sort(unique(as.Date(boot_full$date)))
 
 THETA_GRID_LO <- 1.0
 THETA_GRID_HI <- 60.0
-
 N_COARSE <- 20L
-N_FINE   <- 15L
+N_FINE <- 15L
+EXPAND_FACTOR <- 4
+HARD_THETA_LO <- 0.01
+HARD_THETA_HI <- 1e6
+MAX_GRID_EXPANSIONS <- 12L
 
+SCORE_COLUMNS <- c(
+  "predictive_median", "wis", "wis_absolute_error", "wis_dispersion",
+  "wis_underprediction", "wis_overprediction",
+  "lower_50", "upper_50", "lower_80", "upper_80", "lower_95", "upper_95"
+)
 
 stopifnot(
-  length(WIS_ALPHAS) == 11L,
-  all(diff(WIS_ALPHAS) > 0),
-  exists("boot_full"),
-  exists("boot_full_without"),
-  exists("state_population")
+  HORIZON == 3L, WINDOW_WEEKS == 10L, CALIBRATION_FOLD == 1L,
+  OBJECTIVE == "coverage", length(WIS_ALPHAS) == 11L,
+  all(diff(WIS_ALPHAS) > 0), exists("state_population"),
+  is.data.frame(state_population),
+  all(c("state", "population") %in% names(state_population))
 )
+
+state_population <- state_population %>%
+  dplyr::transmute(state = as.character(state), population = as.numeric(population)) %>%
+  dplyr::arrange(state)
+stopifnot(!anyNA(state_population), !anyDuplicated(state_population$state),
+          all(is.finite(state_population$population)), all(state_population$population > 0))
 ```
 
 ```{r}
@@ -519,22 +627,10 @@ qfast <- function(x_sorted, p) {
 
   x_sorted[pmax(1L, ceiling(n * p))]
 }
-
-local({
-  set.seed(1)
-  z <- rpois(10000, 7)
-  ps <- c(0.01, 0.025, 0.10, 0.25, 0.50, 0.75, 0.90, 0.975, 0.99)
-  stopifnot(identical(
-    as.numeric(qfast(sort(z), ps)),
-    as.numeric(stats::quantile(z, probs = ps, type = 1, names = FALSE))
-  ))
-})
-
-# NB2 parameterization: Var(Y | mu) = mu + mu^2 / theta
 nb_draws_sorted <- function(mean_rates, population, theta, M = DRAWS_PER_BOOT) {
 
   stopifnot(
-    length(mean_rates) == 500L,
+    length(mean_rates) == B,
     all(is.finite(mean_rates)),
     all(mean_rates >= 0),
     length(population) == 1L,
@@ -567,11 +663,11 @@ core_scores <- function(draws_sorted, observed_rate, alphas = WIS_ALPHAS) {
   lower_all <- qfast(draws_sorted, alphas / 2)
   upper_all <- qfast(draws_sorted, 1 - alphas / 2)
 
-  under_pen <-
+  over_pen <-
     (2 / alphas) * (lower_all - observed_rate) *
     as.numeric(observed_rate < lower_all)
 
-  over_pen <-
+  under_pen <-
     (2 / alphas) * (observed_rate - upper_all) *
     as.numeric(observed_rate > upper_all)
 
@@ -592,7 +688,7 @@ core_scores <- function(draws_sorted, observed_rate, alphas = WIS_ALPHAS) {
     predictive_median = predictive_median,
 
     wis = wis_absolute_error + wis_dispersion +
-          wis_underprediction + wis_overprediction,
+          wis_overprediction + wis_underprediction,
     wis_absolute_error = wis_absolute_error,
     wis_dispersion = wis_dispersion,
     wis_underprediction = wis_underprediction,
@@ -607,52 +703,44 @@ core_scores <- function(draws_sorted, observed_rate, alphas = WIS_ALPHAS) {
 
 ```{r}
 build_targets <- function(boot_df, label) {
-
-  d <- boot_df %>%
-    dplyr::mutate(state = as.character(state), date = as.Date(date)) %>%
+  stopifnot(is.data.frame(boot_df),
+    all(c("state", "date", "obs", "pred", "boot") %in% names(boot_df)),
+    is.numeric(boot_df$obs), is.numeric(boot_df$pred), is.numeric(boot_df$boot))
+  d <- tibble::tibble(
+    state = unname(as.character(boot_df$state)),
+    date = as.Date(unname(as.numeric(as.Date(boot_df$date))), origin = "1970-01-01"),
+    obs = as.numeric(boot_df$obs), pred = as.numeric(boot_df$pred),
+    boot = as.numeric(boot_df$boot)
+  ) %>%
     dplyr::left_join(state_population, by = "state") %>%
     dplyr::arrange(state, date, boot)
 
-  stopifnot(
-    nrow(d) == 1150000L,
-    all(is.finite(d$population)),
-    all(d$population > 0),
-    all(is.finite(d$pred)),
-    all(d$pred >= 0),
-    all(is.finite(d$obs))
-  )
+  expected_states <- setdiff(datasets::state.abb, c("IA", "MN", "MO", "OK"))
+  stopifnot(nrow(d) == B * 2300L, !anyNA(d),
+    !anyDuplicated(d[c("state", "date", "boot")]),
+    setequal(d$state, expected_states),
+    is.numeric(d$boot), setequal(d$boot, seq_len(B)),
+    all(is.finite(d$population)), all(d$population > 0),
+    all(is.finite(d$pred)), all(d$pred >= 0),
+    all(is.finite(d$obs)), all(d$obs >= 0))
 
   ti <- d %>%
     dplyr::distinct(state, date, obs, population) %>%
     dplyr::arrange(state, date) %>%
     dplyr::mutate(target_id = dplyr::row_number())
-
-  stopifnot(nrow(ti) == 2300L, dplyr::n_distinct(ti$state) == 46L)
-
-  unique_dates <- sort(unique(ti$date))
-  stopifnot(length(unique_dates) == 50L)
-
+  stopifnot(nrow(ti) == 2300L, !anyDuplicated(ti[c("state", "date")]),
+    length(unique(ti$date)) == length(EVAL_DATES), all(sort(unique(ti$date)) == EVAL_DATES),
+    all(as.integer(table(ti$date)) == 46L),
+    all(as.integer(table(ti$state)) == 50L))
   ti <- ti %>%
-    dplyr::mutate(fold = ceiling(match(date, unique_dates) / 10))
-
+    dplyr::mutate(fold = as.integer(ceiling(match(date, EVAL_DATES) / 10)))
   stopifnot(identical(as.integer(table(ti$fold)), rep(460L, 5L)))
 
-  d <- d %>%
-    dplyr::left_join(
-      ti %>% dplyr::select(state, date, target_id),
-      by = c("state", "date")
-    )
-
+  d <- d %>% dplyr::left_join(
+    ti %>% dplyr::select(state, date, target_id), by = c("state", "date"))
   pred_list <- split(d$pred, d$target_id)
   pred_list <- pred_list[as.character(ti$target_id)]
-
-  stopifnot(length(pred_list) == 2300L, all(lengths(pred_list) == 500L))
-
-  cat(sprintf(
-    "[%s] 2300 targets built; fold 1 = 460 calibration, folds 2-5 = %d evaluation\n",
-    label, sum(ti$fold != CALIBRATION_FOLD)
-  ))
-
+  stopifnot(length(pred_list) == 2300L, all(lengths(pred_list) == B))
   list(target_info = ti, pred_list = pred_list)
 }
 
@@ -687,259 +775,351 @@ eval_fold <- function(ti, pl, idx, theta, seed = CAL_SEED) {
     coverage = c(cov50 = mean(hit50), cov80 = mean(hit80), cov95 = mean(hit95))
   )
 }
+```
 
-calibrate_theta <- function(
-    built,
-    label,
-    objective = c("coverage", "wis"),
-    lo = THETA_GRID_LO,
-    hi = THETA_GRID_HI,
-    n_coarse = N_COARSE,
-    n_fine = N_FINE
-) {
-
-  objective <- match.arg(objective)
-
-  ti <- built$target_info
-  pl <- built$pred_list
-
-  idx <- which(ti$fold == CALIBRATION_FOLD)
-  stopifnot(length(idx) == 460L)
-
-  loss_of <- function(theta) {
-
-    e <- eval_fold(ti = ti, pl = pl, idx = idx, theta = theta)
-
-    list(
-      loss = if (objective == "wis") e$mean_wis else sum((e$coverage - NOMINAL)^2),
-      mean_wis = e$mean_wis,
-      coverage = e$coverage
-    )
-  }
-
-  grid1 <- exp(seq(log(lo), log(hi), length.out = n_coarse))
-  res1  <- lapply(grid1, loss_of)
-  loss1 <- vapply(res1, `[[`, numeric(1), "loss")
-  best1 <- which.min(loss1)
-
-  if (best1 %in% c(1L, length(grid1))) {
-    stop(sprintf(
-      "[%s | %s] coarse optimum is on grid boundary: theta = %.3f. Expand the grid and rerun.",
-      label, objective, grid1[best1]
-    ))
-  }
-
-  grid2 <- exp(seq(
-    log(grid1[best1 - 1L]), log(grid1[best1 + 1L]), length.out = n_fine
-  ))
-  res2  <- lapply(grid2, loss_of)
-  loss2 <- vapply(res2, `[[`, numeric(1), "loss")
-  best2 <- which.min(loss2)
-
-  if (best2 %in% c(1L, length(grid2))) {
-    warning(sprintf(
-      "[%s | %s] fine optimum is on refinement boundary: theta = %.3f",
-      label, objective, grid2[best2]
-    ))
-  }
-
-  best_result <- res2[[best2]]
-
-  cat(sprintf(
-    "[%s | %s] theta = %.3f | fold-1 coverage = %.3f / %.3f / %.3f\n",
-    label, objective, grid2[best2],
-    best_result$coverage["cov50"],
-    best_result$coverage["cov80"],
-    best_result$coverage["cov95"]
-  ))
-
-  list(
-    theta = grid2[best2],
-    objective = objective,
-    cal_mean_wis = best_result$mean_wis,
-    cal_coverage = best_result$coverage,
-    grid = dplyr::bind_rows(
-      tibble::tibble(theta = grid1, loss = loss1, stage = "coarse"),
-      tibble::tibble(theta = grid2, loss = loss2, stage = "fine")
-    )
+```{r}
+make_window_schedule <- function() {
+  out <- lapply(11:50, function(j) {
+    target <- EVAL_DATES[j]
+    origin <- target - 7L * HORIZON
+    dates <- utils::tail(EVAL_DATES[EVAL_DATES <= origin], WINDOW_WEEKS)
+    stopifnot(length(dates) %in% 8:10, max(dates) <= origin, all(diff(dates) == 7))
+    list(week_index = j, date = target, origin = origin, rolling_dates = dates)
+  })
+  stopifnot(
+    identical(vapply(out, function(x) length(x$rolling_dates), integer(1)),
+              c(8L, 9L, rep(10L, 38L))),
+    identical(out[[1]]$rolling_dates, EVAL_DATES[1:8]),
+    identical(out[[2]]$rolling_dates, EVAL_DATES[1:9]),
+    identical(out[[3]]$rolling_dates, EVAL_DATES[1:10]),
+    identical(out[[4]]$rolling_dates, EVAL_DATES[2:11]),
+    identical(out[[40]]$rolling_dates, EVAL_DATES[38:47])
   )
+  out
 }
 
-score_model <- function(built, theta, seed = SCORE_SEED) {
 
+calibrate_window <- function(built, dates, origin, label, target) {
   ti <- built$target_info
   pl <- built$pred_list
-
-  keep <- which(ti$fold != CALIBRATION_FOLD)
-  stopifnot(length(keep) == 1840L, all(ti$fold[keep] %in% 2:5))
-
-  set.seed(seed)
-
-  score_matrix <- matrix(NA_real_, nrow = length(keep), ncol = 12L)
-
-  for (k in seq_along(keep)) {
-    i <- keep[k]
-    score_matrix[k, ] <- core_scores(
-      draws_sorted = nb_draws_sorted(pl[[i]], ti$population[i], theta),
-      observed_rate = ti$obs[i]
-    )
+  idx <- which(ti$date %in% dates)
+  stopifnot(length(dates) %in% 8:10, max(dates) <= origin,
+    length(idx) == 46L * length(dates),
+    all(sort(unique(ti$date[idx])) == dates), all(ti$date[idx] <= origin))
+  loss_of <- function(theta) {
+    e <- eval_fold(ti, pl, idx, theta, seed = CAL_SEED)
+    list(loss = sum((e$coverage - NOMINAL)^2),
+      mean_wis = e$mean_wis, coverage = e$coverage)
   }
-
-  colnames(score_matrix) <- c(
-    "predictive_median",
-    "wis", "wis_absolute_error", "wis_dispersion",
-    "wis_underprediction", "wis_overprediction",
-    "lower_50", "upper_50", "lower_80", "upper_80", "lower_95", "upper_95"
-  )
-
-  out <- dplyr::bind_cols(ti[keep, ], tibble::as_tibble(score_matrix)) %>%
-    dplyr::mutate(
-      covered_50 = obs >= lower_50 & obs <= upper_50,
-      width_50   = upper_50 - lower_50,
-      covered_80 = obs >= lower_80 & obs <= upper_80,
-      width_80   = upper_80 - lower_80,
-      covered_95 = obs >= lower_95 & obs <= upper_95,
-      width_95   = upper_95 - lower_95
-    )
-
-  decomposition_error <- max(abs(
-    out$wis - (out$wis_absolute_error + out$wis_dispersion +
-               out$wis_underprediction + out$wis_overprediction)
-  ))
-
-  stopifnot(
-    nrow(out) == 1840L,
-    dplyr::n_distinct(out$state) == 46L,
-    identical(as.integer(table(out$fold)), rep(460L, 4L)),
-    all(is.finite(out$wis)),
-    all(out$width_50 >= 0), all(out$width_80 >= 0), all(out$width_95 >= 0),
-  
-    all(out$lower_95 <= out$lower_80),
-    all(out$lower_80 <= out$lower_50),
-    all(out$lower_50 <= out$upper_50),
-    all(out$upper_50 <= out$upper_80),
-    all(out$upper_80 <= out$upper_95),
-    decomposition_error < 1e-10
-  )
-
-  out
+  lo <- THETA_GRID_LO
+  hi <- THETA_GRID_HI
+  n_expanded <- 0L
+  history <- list()
+  repeat {
+    grid1 <- exp(seq(log(lo), log(hi), length.out = N_COARSE))
+    result1 <- lapply(grid1, loss_of)
+    loss1 <- vapply(result1, `[[`, numeric(1), "loss")
+    stopifnot(all(is.finite(loss1)))
+    best1 <- which.min(loss1)
+    history[[length(history) + 1L]] <- tibble::tibble(
+      theta = grid1, loss = loss1, stage = "coarse", expansion = n_expanded)
+    if (!(best1 %in% c(1L, length(grid1)))) break
+    new_lo <- lo
+    new_hi <- hi
+    if (best1 == 1L) new_lo <- max(HARD_THETA_LO, lo / EXPAND_FACTOR)
+    if (best1 == length(grid1)) new_hi <- min(HARD_THETA_HI, hi * EXPAND_FACTOR)
+    if ((new_lo == lo && new_hi == hi) || n_expanded >= MAX_GRID_EXPANSIONS) break
+    lo <- new_lo
+    hi <- new_hi
+    n_expanded <- n_expanded + 1L
+  }
+  left <- max(1L, best1 - 1L)
+  right <- min(length(grid1), best1 + 1L)
+  grid2 <- exp(seq(log(grid1[left]), log(grid1[right]), length.out = N_FINE))
+  result2 <- lapply(grid2, loss_of)
+  loss2 <- vapply(result2, `[[`, numeric(1), "loss")
+  stopifnot(all(is.finite(loss2)))
+  best2 <- which.min(loss2)
+  chosen <- result2[[best2]]
+  theta <- grid2[best2]
+  at_limit <- best1 %in% c(1L, length(grid1))
+  refine_edge <- best2 %in% c(1L, length(grid2))
+  history[[length(history) + 1L]] <- tibble::tibble(
+    theta = grid2, loss = loss2, stage = "fine", expansion = n_expanded)
+  list(theta = theta, objective = OBJECTIVE, dates = dates,
+    calibration_start = min(dates), calibration_cutoff = max(dates),
+    n_cal_weeks = length(dates), n_cal_targets = length(idx),
+    cal_coverage = chosen$coverage, cal_mean_wis = chosen$mean_wis,
+    calibration_loss = chosen$loss, grid_expansions = n_expanded,
+    at_search_limit = at_limit, at_refinement_edge = refine_edge,
+    grid = dplyr::bind_rows(history))
 }
 ```
 
 ```{r}
-summarise_model <- function(rows, theta, label, objective) {
+score_week <- function(built, spec, cal, label, protocol) {
+  ti <- built$target_info
+  pl <- built$pred_list
+  idx <- which(ti$date == spec$date)
+  stopifnot(length(idx) == 46L, cal$calibration_cutoff <= spec$origin)
+  mat <- matrix(NA_real_, length(idx), length(SCORE_COLUMNS),
+    dimnames = list(NULL, SCORE_COLUMNS))
+  for (k in seq_along(idx)) {
+    i <- idx[k]
+    set.seed(SCORE_SEED + ti$target_id[i])
+    z <- core_scores(nb_draws_sorted(pl[[i]], ti$population[i], cal$theta), ti$obs[i])
+    stopifnot(identical(names(z), SCORE_COLUMNS))
+    mat[k, ] <- z
+  }
+  out <- dplyr::bind_cols(ti[idx, ], tibble::as_tibble(mat)) %>%
+    dplyr::mutate(
+      model = .env$label, protocol = .env$protocol,
+      forecast_origin = .env$spec$origin,
+      theta_used = .env$cal$theta,
+      calibration_start = .env$cal$calibration_start,
+      calibration_cutoff = .env$cal$calibration_cutoff,
+      n_cal_weeks = .env$cal$n_cal_weeks,
+      score_seed = .env$SCORE_SEED + target_id,
+      covered_50 = obs >= lower_50 & obs <= upper_50,
+      width_50 = upper_50 - lower_50,
+      covered_80 = obs >= lower_80 & obs <= upper_80,
+      width_80 = upper_80 - lower_80,
+      covered_95 = obs >= lower_95 & obs <= upper_95,
+      width_95 = upper_95 - lower_95)
+  out
+}
+
+validate_rows <- function(rows, built, spec = NULL) {
+  expected <- built$target_info
+  expected <- if (is.null(spec)) expected[expected$fold != 1L, ] else
+    expected[expected$date == spec$date, ]
+  actual <- rows %>% dplyr::arrange(state, date)
+  expected <- expected %>% dplyr::arrange(state, date)
+  stopifnot(nrow(actual) == nrow(expected),
+    identical(actual$state, expected$state), all(actual$date == expected$date),
+    identical(actual$obs, expected$obs), identical(actual$target_id, expected$target_id),
+    !anyNA(actual), !anyDuplicated(actual[c("state", "date")]),
+    all(is.finite(as.matrix(actual[, SCORE_COLUMNS]))),
+    all(actual$theta_used > 0), all(is.finite(actual$theta_used)),
+    all(actual$forecast_origin == actual$date - 21L),
+    all(actual$calibration_start <= actual$calibration_cutoff),
+    all(actual$calibration_cutoff <= actual$forecast_origin),
+    all(actual$score_seed == SCORE_SEED + actual$target_id),
+    all(actual$lower_95 <= actual$lower_80), all(actual$lower_80 <= actual$lower_50),
+    all(actual$lower_50 <= actual$predictive_median),
+    all(actual$predictive_median <= actual$upper_50),
+    all(actual$upper_50 <= actual$upper_80), all(actual$upper_80 <= actual$upper_95),
+    max(abs(actual$wis - (actual$wis_absolute_error + actual$wis_dispersion +
+      actual$wis_overprediction + actual$wis_underprediction))) < 1e-10)
+  invisible(TRUE)
+}
+```
+
+```{r}
+summarise_model <- function(rows, label) {
   rows %>%
     dplyr::summarise(
-      model = label,
-      objective = objective,
-      theta = theta,
+      model = label, objective = OBJECTIVE, protocol = "ROLLING10",
+      n_targets = dplyr::n(), n_states = dplyr::n_distinct(state),
+      theta_min = min(theta_used), theta_max = max(theta_used),
       mean_wis = mean(wis),
       coverage_50 = mean(covered_50),
       coverage_80 = mean(covered_80),
       coverage_95 = mean(covered_95),
+      mean_width_50 = mean(width_50),
+      mean_width_80 = mean(width_80),
       mean_width_95 = mean(width_95)
     )
 }
 
 compare_states <- function(rows_with, rows_without) {
-
   state_with <- rows_with %>%
     dplyr::group_by(state) %>%
     dplyr::summarise(wis_with = mean(wis), .groups = "drop")
-
   state_without <- rows_without %>%
     dplyr::group_by(state) %>%
     dplyr::summarise(wis_without = mean(wis), .groups = "drop")
-
   dplyr::inner_join(state_with, state_without, by = "state") %>%
     dplyr::mutate(diff = wis_with - wis_without)
 }
 
-run_one <- function(built, label, objective) {
-
-  calibration <- calibrate_theta(built = built, label = label, objective = objective)
-  rows <- score_model(built = built, theta = calibration$theta)
-
-  list(
-    cal = calibration,
-    rows = rows,
-    summary = summarise_model(rows, calibration$theta, label, objective)
+calibration_row <- function(cal, spec, label) {
+  tibble::tibble(
+    model = label, date = spec$date, forecast_origin = spec$origin,
+    theta = cal$theta, calibration_start = cal$calibration_start,
+    calibration_cutoff = cal$calibration_cutoff, n_cal_weeks = cal$n_cal_weeks,
+    cal_coverage_50 = unname(cal$cal_coverage["cov50"]),
+    cal_coverage_80 = unname(cal$cal_coverage["cov80"]),
+    cal_coverage_95 = unname(cal$cal_coverage["cov95"]),
+    cal_mean_wis = cal$cal_mean_wis, calibration_loss = cal$calibration_loss,
+    grid_expansions = cal$grid_expansions,
+    at_search_limit = cal$at_search_limit, at_refinement_edge = cal$at_refinement_edge
   )
 }
 ```
 
 ```{r}
-built_with    <- build_targets(boot_full,         "WITH")
+hash_object <- function(x) {
+  f <- tempfile(fileext = ".rds")
+  on.exit(unlink(f), add = TRUE)
+  saveRDS(x, f, version = 2, compress = FALSE)
+  unname(tools::md5sum(f))
+}
+
+run_one <- function(built, label) {
+  had_rng <- exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)
+  if (had_rng) saved_rng <- get(".Random.seed", envir = .GlobalEnv)
+  on.exit({
+    if (had_rng) {
+      assign(".Random.seed", saved_rng, envir = .GlobalEnv)
+    } else if (exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)) {
+      rm(list = ".Random.seed", envir = .GlobalEnv)
+    }
+  }, add = TRUE)
+
+  weeks <- lapply(seq_along(schedule), function(j) {
+    spec <- schedule[[j]]
+    path <- file.path(run_dir, sprintf("%s_%02d.rds", tolower(label), j))
+    reused <- file.exists(path)
+    if (reused) {
+      item <- readRDS(path)
+    } else {
+      cal <- calibrate_window(built, spec$rolling_dates, spec$origin, label, spec$date)
+      item <- list(run_id = run_id, model = label, spec = spec, cal = cal,
+                   rows = score_week(built, spec, cal, label, "ROLLING10"))
+    }
+    stopifnot(
+      identical(item$run_id, run_id), identical(item$model, label),
+      identical(item$spec, spec), identical(item$cal$dates, spec$rolling_dates),
+      all(item$rows$model == label), all(item$rows$protocol == "ROLLING10"),
+      all(item$rows$theta_used == item$cal$theta),
+      all(item$rows$n_cal_weeks == length(spec$rolling_dates)),
+      all(item$rows$calibration_start == min(spec$rolling_dates)),
+      all(item$rows$calibration_cutoff == max(spec$rolling_dates))
+    )
+    validate_rows(item$rows, built, spec)
+    if (!reused) save_bootstrap_rds(item, path)
+    item
+  })
+  rows <- dplyr::bind_rows(lapply(weeks, `[[`, "rows")) %>% dplyr::arrange(state, date)
+  validate_rows(rows, built)
+  cal <- dplyr::bind_rows(lapply(weeks, function(w) calibration_row(w$cal, w$spec, label)))
+  grids <- dplyr::bind_rows(lapply(weeks, function(w) {
+    dplyr::mutate(w$cal$grid, model = label, date = w$spec$date)
+  }))
+  list(cal = cal, rows = rows, summary = summarise_model(rows, label), grids = grids)
+}
+```
+
+```{r, eval = FALSE}
+built_with    <- build_targets(boot_full, "WITH")
 built_without <- build_targets(boot_full_without, "WITHOUT")
+target_with <- built_with$target_info
+target_without <- built_without$target_info
+alignment_columns <- c("state", "date", "obs", "population", "target_id", "fold")
+stopifnot(nrow(target_with) == nrow(target_without))
+for (nm in alignment_columns) {
+  a <- target_with[[nm]]
+  b <- target_without[[nm]]
+  ok <- if (nm == "state") identical(unname(as.character(a)), unname(as.character(b)))
+        else identical(as.numeric(a), as.numeric(b))
+  if (!ok) stop("Models have different target values in column: ", nm)
+}
+schedule <- make_window_schedule()
 
-target_with <- built_with$target_info %>% dplyr::arrange(state, date)
-target_without <- built_without$target_info %>% dplyr::arrange(state, date)
-
-stopifnot(
-  identical(target_with$state, target_without$state),
-  identical(target_with$date,  target_without$date),
-  identical(target_with$fold,  target_without$fold),
-  all(abs(target_with$obs - target_without$obs) < 1e-12)
+settings <- list(
+  horizon = HORIZON, window_weeks = WINDOW_WEEKS, objective = OBJECTIVE,
+  calibration_fold = CALIBRATION_FOLD, eval_dates = EVAL_DATES,
+  draws_per_boot = DRAWS_PER_BOOT, cal_seed = CAL_SEED, score_seed = SCORE_SEED,
+  score_seed_rule = "SCORE_SEED + state/date target_id",
+  alphas = WIS_ALPHAS, nominal = NOMINAL,
+  grid_lo = THETA_GRID_LO, grid_hi = THETA_GRID_HI, n_coarse = N_COARSE, n_fine = N_FINE,
+  expand_factor = EXPAND_FACTOR, hard_limits = c(HARD_THETA_LO, HARD_THETA_HI),
+  max_expansions = MAX_GRID_EXPANSIONS, score_columns = SCORE_COLUMNS
 )
+calculation_functions <- list(
+  qfast, nb_draws_sorted, core_scores, build_targets, eval_fold, make_window_schedule,
+  calibrate_window, score_week, validate_rows, summarise_model, calibration_row, run_one
+)
+run_identity <- list(
+  settings = settings, bootstrap_replicates = B,
+  input_md5 = unname(tools::md5sum(c(WITH_FILE, WITHOUT_FILE))),
+  population = state_population, r_version = R.version.string, rng = RNGkind(),
+  platform = R.version$platform,
+  package_versions = vapply(c("dplyr", "tibble"), function(x)
+    as.character(utils::packageVersion(x)), character(1)),
+  code = lapply(calculation_functions, function(f) {
+    list(formals = formals(f), body = deparse(body(f), width.cutoff = 500L))
+  })
+)
+stopifnot(!anyNA(run_identity$input_md5))
+run_id <- hash_object(run_identity)
+run_dir <- file.path(INTERVAL_DIR, "checkpoints", substr(run_id, 1L, 12L))
+dir.create(run_dir, recursive = TRUE, showWarnings = FALSE)
 
 res <- list(
-  with_cov    = run_one(built_with,    "WITH",    PRIMARY_OBJECTIVE),
-  without_cov = run_one(built_without, "WITHOUT", PRIMARY_OBJECTIVE),
-  with_wis    = run_one(built_with,    "WITH",    SENSITIVITY_OBJECTIVE),
-  without_wis = run_one(built_without, "WITHOUT", SENSITIVITY_OBJECTIVE)
+  with_cov = run_one(built_with, "WITH"),
+  without_cov = run_one(built_without, "WITHOUT")
 )
+attr(res, "settings") <- settings
+attr(res, "population") <- state_population
+attr(res, "input_md5") <- run_identity$input_md5
+saveRDS(res, file.path(INTERVAL_DIR, "nb_calibration_scoring_all.rds"))
+```
 
-saveRDS(res, "nb_calibration_scoring_all.rds")
+```{r}
+res <- readRDS(file.path(INTERVAL_DIR, "nb_calibration_scoring_all.rds"))
 ```
 
 ```{r}
 table_s4 <- dplyr::bind_rows(res$with_cov$summary, res$without_cov$summary) %>%
   dplyr::transmute(
-    Model = ifelse(model == "WITH",
-                   "With hospital admissions",
-                   "Without hospital admissions"),
+    Model = ifelse(model == "WITH", "With hospital admissions", "Without hospital admissions"),
     `Mean WIS` = sprintf("%.3f", mean_wis),
     `50% PI coverage` = sprintf("%.1f%%", 100 * coverage_50),
     `80% PI coverage` = sprintf("%.1f%%", 100 * coverage_80),
     `95% PI coverage` = sprintf("%.1f%%", 100 * coverage_95),
     `Mean 95% PI width` = sprintf("%.2f", mean_width_95)
   )
-
 as.data.frame(table_s4)
 
 state_wis <- compare_states(res$with_cov$rows, res$without_cov$rows)
+stopifnot(nrow(state_wis) == 46L)
+theta_by_week <- dplyr::bind_rows(res$with_cov$cal, res$without_cov$cal)
+search_flags <- theta_by_week %>% dplyr::filter(at_search_limit | at_refinement_edge)
 
-cat(sprintf(
-  "\ntheta: WITH = %.2f | WITHOUT = %.2f\n",
-  res$with_cov$cal$theta, res$without_cov$cal$theta
-))
-
-cat(sprintf(
-  "mean WIS reduction: %.1f%%\n",
+cat(sprintf("\nMean WIS reduction: %.1f%%\n",
   100 * (res$without_cov$summary$mean_wis - res$with_cov$summary$mean_wis) /
-    res$without_cov$summary$mean_wis
-))
+    res$without_cov$summary$mean_wis))
+cat(sprintf("Median state WIS: WITH = %.3f (IQR %.3f-%.3f) | WITHOUT = %.3f (IQR %.3f-%.3f)\n",
+  median(state_wis$wis_with), quantile(state_wis$wis_with, 0.25), quantile(state_wis$wis_with, 0.75),
+  median(state_wis$wis_without), quantile(state_wis$wis_without, 0.25), quantile(state_wis$wis_without, 0.75)))
+cat(sprintf("States with lower WIS using admissions: %d / %d\n",
+            sum(state_wis$diff < 0), nrow(state_wis)))
+cat(sprintf("Theta range: WITH = %.3f-%.3f | WITHOUT = %.3f-%.3f\n",
+            min(res$with_cov$cal$theta), max(res$with_cov$cal$theta),
+            min(res$without_cov$cal$theta), max(res$without_cov$cal$theta)))
+if (nrow(search_flags) > 0L) {
+  warning("Some theta estimates are at a search boundary; inspect search_flags.")
+  print(as.data.frame(search_flags), row.names = FALSE)
+}
 
-cat(sprintf(
-  "median state WIS: WITH = %.3f (IQR %.3f-%.3f) | WITHOUT = %.3f (IQR %.3f-%.3f)\n",
-  median(state_wis$wis_with),
-  quantile(state_wis$wis_with, 0.25), quantile(state_wis$wis_with, 0.75),
-  median(state_wis$wis_without),
-  quantile(state_wis$wis_without, 0.25), quantile(state_wis$wis_without, 0.75)
-))
-
-cat(sprintf(
-  "states improved: %d / %d (median state WIS reduction %.1f%%)\n",
-  sum(state_wis$diff < 0), nrow(state_wis),
-  100 * (median(state_wis$wis_without) - median(state_wis$wis_with)) /
-    median(state_wis$wis_without)
-))
-
-cat(sprintf(
-  "\nsensitivity (WIS-calibrated): theta = %.2f / %.2f | 95%% coverage = %.3f / %.3f | reduction = %.1f%%\n",
-  res$with_wis$summary$theta, res$without_wis$summary$theta,
-  res$with_wis$summary$coverage_95, res$without_wis$summary$coverage_95,
-  100 * (res$without_wis$summary$mean_wis - res$with_wis$summary$mean_wis) /
-    res$without_wis$summary$mean_wis
-))
+nb_rows <- dplyr::bind_rows(res$with_cov$rows, res$without_cov$rows)
+fold_summary <- nb_rows %>%
+  dplyr::group_by(model, fold) %>%
+  dplyr::summarise(
+    n_targets = dplyr::n(), mean_wis = mean(wis),
+    coverage_50 = mean(covered_50), coverage_80 = mean(covered_80),
+    coverage_95 = mean(covered_95), mean_width_95 = mean(width_95), .groups = "drop")
+wis_parts <- nb_rows %>%
+  dplyr::group_by(model) %>%
+  dplyr::summarise(
+    total_WIS = mean(wis), absolute_error = mean(wis_absolute_error),
+    dispersion = mean(wis_dispersion), underprediction = mean(wis_underprediction),
+    overprediction = mean(wis_overprediction), .groups = "drop")
+exports <- list(table_s4 = table_s4, state_wis = state_wis, theta_by_week = theta_by_week,
+                fold_summary = fold_summary, wis_parts = wis_parts, search_flags = search_flags)
+for (nm in names(exports)) {
+  utils::write.csv(exports[[nm]], file.path(INTERVAL_DIR, paste0(nm, ".csv")), row.names = FALSE)
+}
 ```

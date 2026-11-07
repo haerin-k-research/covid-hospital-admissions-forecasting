@@ -545,9 +545,18 @@ legend_plot <- ggplot() +
     plot.background = element_rect(fill = "white", color = NA)
   )
 
+g <- ggplotGrob(legend_plot)
+guide_idx <- which(vapply(g$grobs, function(x) identical(x$name, "guide-box"), logical(1)))
+
+if (length(guide_idx) != 1) {
+  stop("Legend guide-box extraction failed.")
+}
+
+legend_only <- g$grobs[[guide_idx]]
+
 final_plot_with_legend <- cowplot::plot_grid(
   final_plot,
-  cowplot::get_legend(legend_plot),
+  legend_only,
   rel_widths = c(1, 0.23),
   nrow = 1
 )
@@ -624,8 +633,8 @@ plot_with_and_without_hosp_new <- function(
     dplyr::mutate(model = "Without hospital admissions")
 
   stopifnot(
-    nrow(data_with) == 50,
-    nrow(data_without) == 50,
+    nrow(data_with) %in% c(49L, 50L),
+    nrow(data_without) == nrow(data_with),
     identical(data_with$date, data_without$date),
     isTRUE(all.equal(data_with$obs, data_without$obs, tolerance = 0)),
     all(is.finite(data_with$pred)),
@@ -668,11 +677,6 @@ k_with      <- best_with_hosp_46_overall$k
 idx_with    <- best_with_hosp_46_overall$combo_index
 k_without   <- best_without_hosp_46_overall$k
 idx_without <- best_without_hosp_46_overall$combo_index
-
-stopifnot(
-  k_with == 6, idx_with == 105,
-  k_without == 4, idx_without == 103
-)
 
 get_prediction_46 <- function(k, combo_index) {
 
@@ -722,8 +726,8 @@ stopifnot(
 ```
 
 ```{r}
-selected_states_final <- c("GA", "ID", "IL", "ME")
-state_labels <- c(GA = "Georgia", ID = "Idaho", IL = "Illinois", ME = "Maine")
+selected_states_final <- c("ME", "NJ", "OR", "UT")
+state_labels <- c(ME = "Maine", NJ = "New Jersey", OR = "Oregon", UT = "Utah")
 ylim_range_final <- c(0, 12)
 
 stopifnot(all(selected_states_final %in% prediction_alignment_check$state))
@@ -820,12 +824,147 @@ final_plot_fig4 <- cowplot::plot_grid(
 print(final_plot_fig4)
 
 ggsave(
-  "Fig4_GA_ID_IL_ME_final_k6vs4_46states.png",
+  "Fig4_forecasts.png",
   final_plot_fig4,
   width = 6, height = 4.5, dpi = 300
 )
 ```
 
+
+# State-specific peak accuracy
+
+```{r}
+run_peak_analysis <- function(pred_with, pred_without, fig4_states, half_window = 2L) {
+  windows <- tibble::tibble(
+    peak = c("Delta", "Omicron"),
+    start = as.Date(c("2021-07-25", "2021-12-19")),
+    end = as.Date(c("2021-12-12", "2022-02-27"))
+  )
+  paired <- pred_with %>%
+    dplyr::transmute(state = as.character(state), date = as.Date(date), obs, pred_with = pred) %>%
+    dplyr::inner_join(
+      pred_without %>% dplyr::transmute(
+        state = as.character(state), date = as.Date(date), pred_without = pred
+      ), by = c("state", "date")
+    ) %>% dplyr::arrange(state, date)
+
+  hi_target <- paired$state == "HI" & paired$date == as.Date("2022-02-06")
+  rmse_by_state <- paired[!hi_target, ] %>%
+    dplyr::group_by(state) %>%
+    dplyr::summarise(
+      rmse_with = sqrt(mean((pred_with - obs)^2)),
+      rmse_without = sqrt(mean((pred_without - obs)^2)), .groups = "drop"
+    )
+  paired$pred_with[hi_target] <- NA_real_
+  paired$pred_without[hi_target] <- NA_real_
+
+  neighborhood <- function(d, i) {
+    seq.int(max(1L, i - half_window), min(nrow(d), i + half_window))
+  }
+  local_max_in <- function(d, start, end) {
+    idx <- which(d$date >= start & d$date <= end)
+    idx[vapply(idx, function(i) d$obs[i] >= max(d$obs[neighborhood(d, i)]), logical(1))]
+  }
+  is_local_min <- function(d, i) d$obs[i] <= min(d$obs[neighborhood(d, i)])
+  trough_before <- function(d, p, lo, fallback) {
+    if (p - 1L >= lo) {
+      for (i in rev(seq.int(lo, p - 1L))) if (is_local_min(d, i)) return(i)
+    }
+    fallback
+  }
+  trough_after <- function(d, p, hi, fallback) {
+    if (p + 1L <= hi) {
+      for (i in seq.int(p + 1L, hi)) if (is_local_min(d, i)) return(i)
+    }
+    fallback
+  }
+  pred_peak <- function(d, seg, column) {
+    valid <- seg[is.finite(d[[column]][seg])]
+    if (!length(valid)) stop("No usable forecasts for ", d$state[1])
+    valid[which.max(d[[column]][valid])]
+  }
+  peak_row <- function(d, wave, p, seg) {
+    stopifnot(d$obs[p] > 0)
+    wi <- pred_peak(d, seg, "pred_with")
+    wo <- pred_peak(d, seg, "pred_without")
+    tibble::tibble(
+      state = d$state[1], peak = wave,
+      obs_peak_date = d$date[p], obs_peak = d$obs[p],
+      with_peak_date = d$date[wi], with_peak = d$pred_with[wi],
+      without_peak_date = d$date[wo], without_peak = d$pred_without[wo]
+    )
+  }
+  state_peaks <- function(d) {
+    win <- lapply(seq_len(nrow(windows)), function(w) {
+      which(d$date >= windows$start[w] & d$date <= windows$end[w])
+    })
+    candidates <- lapply(seq_len(nrow(windows)), function(w) {
+      local_max_in(d, windows$start[w], windows$end[w])
+    })
+    if (any(lengths(candidates) == 0L)) stop("No observed local peak for ", d$state[1])
+    p <- vapply(candidates, function(idx) idx[which.max(d$obs[idx])], integer(1))
+    between_idx <- seq.int(p[1], p[2])
+    between <- between_idx[which.min(d$obs[between_idx])]
+
+    delta_lo <- trough_before(d, p[1], win[[1]][1], fallback = win[[1]][1])
+    delta_hi <- trough_after(d, p[1], p[2] - 1L, fallback = between)
+    omicron_lo <- trough_before(d, p[2], p[1] + 1L, fallback = between)
+    omicron_hi <- trough_after(d, p[2], tail(win[[2]], 1), fallback = tail(win[[2]], 1))
+    dplyr::bind_rows(
+      peak_row(d, "Delta", p[1], seq.int(delta_lo, delta_hi)),
+      peak_row(d, "Omicron", p[2], seq.int(omicron_lo, omicron_hi))
+    )
+  }
+
+  peaks <- purrr::map_dfr(split(paired, paired$state), state_peaks) %>%
+    dplyr::mutate(
+      amp_err_with = 100 * (with_peak - obs_peak) / obs_peak,
+      amp_err_without = 100 * (without_peak - obs_peak) / obs_peak,
+      tim_with = as.numeric(with_peak_date - obs_peak_date) / 7,
+      tim_without = as.numeric(without_peak_date - obs_peak_date) / 7
+    )
+  med_iqr <- function(x) {
+    q <- quantile(x, c(0.25, 0.75), names = FALSE, type = 7)
+    sprintf("%.1f (%.1f-%.1f)", median(x), q[1], q[2])
+  }
+  table_s8 <- peaks %>% dplyr::group_by(peak) %>% dplyr::summarise(
+    amp_with = med_iqr(abs(amp_err_with)),
+    amp_without = med_iqr(abs(amp_err_without)),
+    tim_with = med_iqr(abs(tim_with)),
+    tim_without = med_iqr(abs(tim_without)), .groups = "drop"
+  )
+
+  peak_flags <- peaks %>% dplyr::group_by(state) %>% dplyr::summarise(
+    peak_better_both = all(abs(amp_err_with) < abs(amp_err_without)), .groups = "drop"
+  )
+  fig4_eligibility <- rmse_by_state %>%
+    dplyr::left_join(peak_flags, by = "state") %>%
+    dplyr::filter(state %in% fig4_states)
+  stopifnot(all(fig4_eligibility$rmse_with < fig4_eligibility$rmse_without &
+                  fig4_eligibility$peak_better_both))
+  # Overall RMSE with wave-specific peak comparisons.
+  fig4_selection <- peaks %>% dplyr::filter(state %in% fig4_states) %>%
+    dplyr::left_join(rmse_by_state, by = "state") %>%
+    dplyr::transmute(
+      state, peak, rmse_with, rmse_without,
+      pct_reduction = dplyr::if_else(rmse_without > 0,
+        100 * (rmse_without - rmse_with) / rmse_without, NA_real_),
+      peak_better = abs(amp_err_with) < abs(amp_err_without)
+    ) %>% dplyr::arrange(match(state, fig4_states), match(peak, windows$peak))
+  fig4_peaks <- peaks %>% dplyr::filter(state %in% fig4_states) %>%
+    dplyr::arrange(match(state, fig4_states), match(peak, windows$peak))
+
+  list(peaks = peaks, table_s8 = table_s8,
+       fig4_selection = fig4_selection, fig4_peaks = fig4_peaks)
+}
+
+peak_analysis <- run_peak_analysis(
+  pred_with_final_46, pred_without_final_46,
+  fig4_states = selected_states_final, half_window = 2L
+)
+print(peak_analysis$fig4_selection, n = Inf, width = Inf)
+print(peak_analysis$fig4_peaks, n = Inf, width = Inf)
+```
 
 # Figure 5
 
@@ -887,8 +1026,34 @@ stopifnot(
   all(is.finite(pred_compare_46$pred_without))
 )
 
+
+with_predictors <- combn(12, best_with_hosp_46_overall$k, simplify = FALSE)[[
+  best_with_hosp_46_overall$combo_index
+]]
+nested_predictors <- setdiff(with_predictors, 11L)
+stopifnot(length(nested_predictors) > 0L)
+nested_combinations <- combn(12, length(nested_predictors), simplify = FALSE)
+nested_index <- which(vapply(nested_combinations, function(x) {
+  identical(as.integer(x), as.integer(nested_predictors))
+}, logical(1)))
+stopifnot(length(nested_index) == 1L)
+pred_without_nested_46 <- get_prediction_46(length(nested_predictors), nested_index)
+
+pred_compare_nested_46 <- pred_with_final_46 %>%
+  dplyr::rename(pred_with = pred) %>%
+  dplyr::inner_join(
+    pred_without_nested_46 %>% dplyr::select(state, date, pred_without = pred),
+    by = c("state", "date")
+  )
+stopifnot(nrow(pred_compare_nested_46) == 2300L,
+          !anyDuplicated(pred_compare_nested_46[c("state", "date")]))
+
+HI_EXCLUDE_DATE <- as.Date("2022-02-06")
+pred_eval_fig5 <- pred_compare_nested_46 %>%
+  dplyr::filter(!(state == "HI" & date == HI_EXCLUDE_DATE))
+
 PERIOD_DEFS <- data.frame(
-  label = c("Surge 1", "Surge 2", "Later period"),
+  label = c("Period 1", "Period 2", "Period 3"),
   start = as.Date(c("2021-07-25", "2021-12-05", "2022-05-01")),
   end   = as.Date(c("2021-09-12", "2022-01-23", "2022-06-05")),
   stringsAsFactors = FALSE
@@ -897,12 +1062,12 @@ PERIOD_DEFS <- data.frame(
 window_lines <- data.frame(start = as.Date(c(PERIOD_DEFS$start, PERIOD_DEFS$end)))
 
 surge_ranges <- PERIOD_DEFS %>%
-  dplyr::filter(label != "Later period") %>%
+  dplyr::filter(label != "Period 3") %>%
   dplyr::mutate(midpoint = start + (end - start) / 2)
 
 later_range <- PERIOD_DEFS %>%
-  dplyr::filter(label == "Later period") %>%
-  dplyr::mutate(label = "Later\nperiod", midpoint = start + (end - start) / 2)
+  dplyr::filter(label == "Period 3") %>%
+  dplyr::mutate(midpoint = start + (end - start) / 2)
 
 surge_window_lines <- data.frame(start = as.Date(c(surge_ranges$start, surge_ranges$end)))
 later_window_lines <- data.frame(start = as.Date(c(later_range$start, later_range$end)))
@@ -975,20 +1140,20 @@ pA <- ggplot(df_ts_obs, aes(x = date, y = obs_med)) +
 
 ```{r}
 # ---- Panel B ----
-error_time <- pred_compare_46 %>%
+error_time <- pred_eval_fig5 %>%
   dplyr::group_by(date) %>%
   dplyr::summarise(
-    median_error_with = median(abs(pred_with - obs)),
-    median_error_without = median(abs(pred_without - obs)),
+    rmse_with = sqrt(mean((pred_with - obs)^2)),
+    rmse_without = sqrt(mean((pred_without - obs)^2)),
     n_states = dplyr::n_distinct(state),
     .groups = "drop"
   )
 
 stopifnot(
   nrow(error_time) == dplyr::n_distinct(pred_compare_46$date),
-  all(error_time$n_states == 46),
-  all(is.finite(error_time$median_error_with)),
-  all(is.finite(error_time$median_error_without))
+  all(error_time$n_states == 46L - as.integer(error_time$date == HI_EXCLUDE_DATE)),
+  all(is.finite(error_time$rmse_with)),
+  all(is.finite(error_time$rmse_without))
 )
 
 pB <- ggplot(error_time, aes(x = date)) +
@@ -998,15 +1163,15 @@ pB <- ggplot(error_time, aes(x = date)) +
     inherit.aes = FALSE,
     color = "grey70", linetype = "dashed", linewidth = 0.5
   ) +
-  geom_line(aes(y = median_error_with, color = "With hospital admissions"),
+  geom_line(aes(y = rmse_with, color = "With hospital admissions"),
             linewidth = 0.9) +
-  geom_line(aes(y = median_error_without, color = "Without hospital admissions"),
+  geom_line(aes(y = rmse_without, color = "Without hospital admissions"),
             linewidth = 0.9) +
   scale_color_manual(values = c(
     "With hospital admissions" = "steelblue",
     "Without hospital admissions" = "darkorange"
   )) +
-  labs(title = "B", x = "Date", y = "Median absolute error", color = NULL) +
+  labs(title = "B", x = "Date", y = "RMSE across states", color = NULL) +
   date_scale + base_theme + title_theme +
   theme(
     legend.position = "top",
@@ -1026,7 +1191,7 @@ assign_period <- function(d) {
   if (length(idx) == 1) PERIOD_DEFS$label[idx] else NA_character_
 }
 
-diff_surge_data <- pred_compare_46 %>%
+diff_surge_data <- pred_eval_fig5 %>%
   dplyr::mutate(period = vapply(date, assign_period, character(1))) %>%
   dplyr::filter(!is.na(period)) %>%
   dplyr::group_by(period, state) %>%
@@ -1044,6 +1209,7 @@ surge_check <- diff_surge_data %>%
   dplyr::group_by(period) %>%
   dplyr::summarise(
     n_states = dplyr::n(),
+    mean_reduction = mean(RMSE_Reduction),
     median_reduction = median(RMSE_Reduction),
     n_states_better_with = sum(RMSE_Reduction > 0),
     .groups = "drop"
@@ -1057,12 +1223,16 @@ c_lo <- floor((min(diff_surge_data$RMSE_Reduction) - 0.15) * 10) / 10
 c_hi <- ceiling((max(diff_surge_data$RMSE_Reduction) + 0.15) * 10) / 10
 
 pC <- ggplot(diff_surge_data, aes(x = period, y = RMSE_Reduction)) +
-  geom_hline(yintercept = 0, linetype = "dashed", color = "#d62728", linewidth = 1) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey55", linewidth = 0.7) +
   geom_boxplot(width = 0.35, fill = "steelblue", alpha = 0.4,
                color = "black", outlier.shape = NA) +
   geom_point(position = position_jitter(width = 0.12, seed = 2122),
              size = 0.75, alpha = 0.7, color = "darkblue") +
-  scale_x_discrete(labels = c("Later period" = "Later\nperiod")) +
+  geom_errorbar(
+    data = surge_check,
+    aes(x = period, ymin = mean_reduction, ymax = mean_reduction),
+    inherit.aes = FALSE, width = 0.34, color = "#d62728", linewidth = 1
+  ) +
   scale_y_continuous(breaks = scales::pretty_breaks(n = 6)) +
   coord_cartesian(ylim = c(c_lo, c_hi)) +
   labs(title = "C", x = NULL, y = "Reduction in RMSE") +
@@ -1617,11 +1787,20 @@ label_plot <- ggplot(labels_df, aes(x = 1.54, y = y, label = Source)) +
   theme_void() +
   theme(plot.margin = margin(t = 35, r = 0, b = 5, l = 5))
 
+g <- ggplotGrob(legend_plot)
+guide_idx <- which(vapply(g$grobs, function(x) identical(x$name, "guide-box"), logical(1)))
+
+if (length(guide_idx) != 1) {
+  stop("Legend guide-box extraction failed.")
+}
+
+legend_only <- g$grobs[[guide_idx]]
+
 final_two_panels <- cowplot::plot_grid(
   label_plot,
   make_panel(df_selected_with, strip_data_with),
   make_panel(df_selected_without, strip_data_without),
-  cowplot::get_legend(legend_plot),
+  legend_only,
   nrow = 1,
   rel_widths = c(0.49, 1, 1, 0.29),
   labels = c("", "A", "B", ""),
@@ -1645,13 +1824,23 @@ library(scales)
 library(grid)
 
 
+HI_EXCLUDE_DATE <- as.Date("2022-02-06")
+
 if (!exists("pred_with_final_46")) {
-  pred_with_final_46 <- get("comb6_median_vac.lag3", envir = .GlobalEnv)$y_predicted_new[[105]] %>%
+  best_with_hosp_46_overall <- all_state_median_results %>%
+    dplyr::filter(has_hospitalization) %>%
+    dplyr::arrange(median_state_rmse_46, k, combo_index) %>%
+    dplyr::slice(1)
+  object_name <- paste0("comb", best_with_hosp_46_overall$k, "_median_vac.lag3")
+  pred_with_final_46 <- get(object_name, envir = .GlobalEnv)$y_predicted_new[[
+    best_with_hosp_46_overall$combo_index
+  ]] %>%
     dplyr::transmute(state = as.character(state), date = as.Date(date), obs, pred) %>%
     dplyr::filter(!state %in% COMMON_EXCLUDE_STATES)
 }
 
 rmse_with_final_46 <- pred_with_final_46 %>%
+  dplyr::filter(!(state == "HI" & date == HI_EXCLUDE_DATE)) %>%
   dplyr::group_by(state) %>%
   dplyr::summarise(
     rmse = sqrt(mean((pred - obs)^2)),
@@ -1661,7 +1850,7 @@ rmse_with_final_46 <- pred_with_final_46 %>%
 
 stopifnot(
   nrow(rmse_with_final_46) == 46,
-  all(rmse_with_final_46$n_predictions == 50)
+  all(rmse_with_final_46$n_predictions == ifelse(rmse_with_final_46$state == "HI", 49L, 50L))
 )
 
 rmse_levels <- c("<0.75", "0.75–0.99", "1.00–1.24",
@@ -1737,8 +1926,13 @@ library(patchwork)
 library(cowplot)
 
 
+pred_with_figS6 <- pred_with_final_46 %>%
+  dplyr::filter(!(state == "HI" & date == HI_EXCLUDE_DATE))
+pred_without_figS6 <- pred_without_final_46 %>%
+  dplyr::filter(!(state == "HI" & date == HI_EXCLUDE_DATE))
+
 state_pages <- split(
-  sort(unique(as.character(pred_with_final_46$state))),
+  sort(unique(as.character(pred_with_figS6$state))),
   ceiling(seq_len(46) / 8)
 )
 
@@ -1749,7 +1943,7 @@ stopifnot(
 
 add_without_forecast <- function(base_plot, state_name) {
 
-  without_data <- pred_without_final_46 %>%
+  without_data <- pred_without_figS6 %>%
     dplyr::filter(state == state_name) %>%
     dplyr::arrange(date)
 
@@ -1765,8 +1959,8 @@ make_state_panel <- function(state_name, y_max) {
 
   base_plot <- plot_with_and_without_hosp_new(
     state_name,
-    pred_with_final_46,
-    pred_without_final_46,
+    pred_with_figS6,
+    pred_without_figS6,
     ylim_range = c(0, y_max)
   )[[2]]
 
@@ -1775,14 +1969,21 @@ make_state_panel <- function(state_name, y_max) {
 
 legend_state <- state_pages[[1]][1]
 
-legend_with_and_without <- cowplot::get_legend(
+g <- ggplotGrob(
   make_state_panel(legend_state, 12) + theme(legend.position = "bottom")
 )
+guide_idx <- which(vapply(g$grobs, function(x) identical(x$name, "guide-box"), logical(1)))
+
+if (length(guide_idx) != 1) {
+  stop("Legend guide-box extraction failed.")
+}
+
+legend_with_and_without <- g$grobs[[guide_idx]]
 
 make_eight_state_page <- function(states) {
 
-  page_with <- pred_with_final_46 %>% dplyr::filter(state %in% states)
-  page_without <- pred_without_final_46 %>% dplyr::filter(state %in% states)
+  page_with <- pred_with_figS6 %>% dplyr::filter(state %in% states)
+  page_without <- pred_without_figS6 %>% dplyr::filter(state %in% states)
 
   y_max <- max(
     12,
@@ -1843,3 +2044,223 @@ purrr::iwalk(all46_pages, function(p, i) {
 ```
 
 
+
+# Figure S7
+
+```{r}
+make_fig_s7_rolling <- function(res, boot_full, boot_full_without,
+                              states = c("ME", "NJ", "OR", "UT"),
+                              draws_per_boot = DRAWS_PER_BOOT,
+                              display_seed = 20260819L,
+                              save_fig = TRUE, out_pdf, out_png) {
+  had_rng <- exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)
+  if (had_rng) saved_rng <- get(".Random.seed", envir = .GlobalEnv)
+  on.exit({
+    if (had_rng) assign(".Random.seed", saved_rng, envir = .GlobalEnv)
+    else if (exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)) {
+      rm(list = ".Random.seed", envir = .GlobalEnv)
+    }
+  }, add = TRUE)
+
+  eval_dates <- seq(as.Date("2021-06-27"), by = "week", length.out = 50L)
+  common_states <- sort(setdiff(state.abb, c("IA", "MN", "MO", "OK")))
+  stopifnot(length(states) == 4L, !anyDuplicated(states), all(states %in% common_states))
+  state_labels <- setNames(state.name, state.abb)
+  model_labels <- c(WITHOUT = "Without hospital admissions", WITH = "With hospital admissions")
+  model_fills <- c("Without hospital admissions" = "#6FAE8A", "With hospital admissions" = "#4F86C6")
+  model_lines <- c("Without hospital admissions" = "#2E6B4A", "With hospital admissions" = "#1F4E79")
+  pi_names <- c("predictive_median", "lower_50", "upper_50", "lower_80", "upper_80", "lower_95", "upper_95")
+  plot_columns <- c("state", "date", "fold", "obs", pi_names)
+  n_boot <- length(unique(boot_full$boot))
+  tolerance <- 1e-8
+
+  rows <- dplyr::bind_rows(res$with_cov$rows, res$without_cov$rows)
+  cal <- dplyr::bind_rows(res$with_cov$cal, res$without_cov$cal) %>%
+    dplyr::mutate(protocol = "ROLLING10")
+  saved_summary <- dplyr::bind_rows(res$with_cov$summary, res$without_cov$summary)
+  stopifnot(length(draws_per_boot) == 1L, is.finite(draws_per_boot),
+            draws_per_boot >= 1L, draws_per_boot == as.integer(draws_per_boot))
+  draws_per_boot <- as.integer(draws_per_boot)
+  target_grid <- tibble::tibble(
+    state = rep(common_states, each = 50L),
+    date = rep(eval_dates, times = 46L),
+    target_id = seq_len(2300L),
+    fold = rep(rep(1:5, each = 10L), times = 46L)
+  )
+  same_keys <- function(a, b) {
+    nrow(a) == nrow(b) && !anyNA(a[c("state", "date")]) &&
+      !anyDuplicated(a[c("state", "date")]) &&
+      identical(as.character(a$state), as.character(b$state)) && all(a$date == b$date)
+  }
+  check_intervals <- function(d) {
+    stopifnot(
+      all(is.finite(as.matrix(d[, c("obs", pi_names)]))),
+      all(d$lower_95 >= 0),
+      all(d$lower_95 <= d$lower_80), all(d$lower_80 <= d$lower_50),
+      all(d$lower_50 <= d$predictive_median), all(d$predictive_median <= d$upper_50),
+      all(d$upper_50 <= d$upper_80), all(d$upper_80 <= d$upper_95)
+    )
+  }
+
+  required <- c(plot_columns, "model", "protocol", "population", "wis", "theta_used",
+                "forecast_origin", "calibration_start", "calibration_cutoff", "n_cal_weeks")
+  stopifnot(is.data.frame(rows), all(required %in% names(rows)),
+            is.data.frame(cal),
+            all(c("model", "protocol", "date", "theta", "n_cal_weeks",
+                  "calibration_start", "calibration_cutoff") %in% names(cal)))
+  rows <- rows %>%
+    dplyr::filter(protocol == "ROLLING10") %>%
+    dplyr::mutate(model = as.character(model), state = as.character(state),
+                   date = as.Date(date), fold = as.integer(fold),
+                   dplyr::across(c(forecast_origin, calibration_start, calibration_cutoff), as.Date)) %>%
+    dplyr::arrange(model, state, date)
+  cal <- cal %>% dplyr::filter(protocol == "ROLLING10") %>%
+    dplyr::mutate(model = as.character(model), date = as.Date(date),
+                   dplyr::across(c(calibration_start, calibration_cutoff), as.Date)) %>%
+    dplyr::arrange(model, date)
+  stopifnot(nrow(rows) == 3680L, setequal(rows$model, c("WITH", "WITHOUT")),
+            nrow(cal) == 80L, setequal(cal$model, c("WITH", "WITHOUT")),
+            !anyNA(rows[required]), !anyNA(cal),
+            !anyDuplicated(cal[c("model", "date")]),
+            all(is.finite(rows$wis)), all(is.finite(rows$theta_used)), all(rows$theta_used > 0),
+            all(is.finite(cal$theta)), all(cal$theta > 0),
+            all(rows$forecast_origin == rows$date - 21L),
+            all(rows$calibration_cutoff <= rows$forecast_origin))
+  check_intervals(rows)
+
+  pop <- rows %>% dplyr::distinct(state, population) %>% dplyr::arrange(state)
+  stopifnot(nrow(pop) == 46L, !anyDuplicated(pop$state),
+            setequal(pop$state, common_states), all(is.finite(pop$population)), all(pop$population > 0))
+
+  for (label in c("WITH", "WITHOUT")) {
+    r <- rows %>% dplyr::filter(model == label)
+    expected <- target_grid %>% dplyr::filter(fold != 1L)
+    stopifnot(same_keys(r, expected), all(r$fold == expected$fold))
+    cals <- cal %>% dplyr::filter(model == label)
+    stopifnot(all(cals$date == eval_dates[11:50]))
+    for (j in seq_len(40L)) {
+      available <- tail(eval_dates[eval_dates <= cals$date[j] - 21L], 10L)
+      rr <- r %>% dplyr::filter(date == cals$date[j])
+      stopifnot(cals$n_cal_weeks[j] == length(available),
+                cals$calibration_start[j] == min(available),
+                cals$calibration_cutoff[j] == max(available),
+                all(rr$theta_used == cals$theta[j]),
+                all(rr$n_cal_weeks == cals$n_cal_weeks[j]),
+                all(rr$calibration_start == cals$calibration_start[j]),
+                all(rr$calibration_cutoff == cals$calibration_cutoff[j]))
+    }
+  }
+
+  built_with <- build_targets(boot_full, "WITH")
+  built_without <- build_targets(boot_full_without, "WITHOUT")
+  for (label in c("WITH", "WITHOUT")) {
+    built <- if (label == "WITH") built_with else built_without
+    ti <- built$target_info
+    stopifnot(same_keys(ti, target_grid),
+              all(ti$target_id == target_grid$target_id), all(ti$fold == target_grid$fold))
+    r <- rows %>% dplyr::filter(model == label)
+    te <- ti %>% dplyr::filter(fold != 1L)
+    stopifnot(same_keys(r, te), all(abs(r$obs - te$obs) <= tolerance),
+              all(r$population == te$population))
+  }
+  stopifnot(same_keys(built_with$target_info, built_without$target_info),
+            all(abs(built_with$target_info$obs - built_without$target_info$obs) <= tolerance))
+
+  # The third scored week uses all ten calibration-fold weeks.
+  theta_first_fold <- function(label) {
+    th <- cal %>% dplyr::filter(model == label, date == eval_dates[13L])
+    stopifnot(nrow(th) == 1L, th$n_cal_weeks == 10L,
+              th$calibration_start == eval_dates[1L], th$calibration_cutoff == eval_dates[10L])
+    th$theta
+  }
+  theta_fold1 <- c(WITH = theta_first_fold("WITH"), WITHOUT = theta_first_fold("WITHOUT"))
+  # Fold 1 is sampled retrospectively for display only.
+  display_intervals <- function(built, label) {
+    ti <- built$target_info
+    idx <- which(ti$state %in% states & ti$fold == 1L)
+    purrr::map_dfr(idx, function(i) {
+      set.seed(display_seed + ti$target_id[i])
+      pop_100k <- ti$population[i] / 1e5
+      mu <- built$pred_list[[i]] * pop_100k
+      draws <- sort(stats::rnbinom(n_boot * draws_per_boot,
+                                    mu = rep(mu, each = draws_per_boot),
+                                    size = theta_fold1[[label]]) / pop_100k)
+      probs <- c(0.50, 0.25, 0.75, 0.10, 0.90, 0.025, 0.975)
+      bounds <- draws[pmax(1L, ceiling(length(draws) * probs))]
+      names(bounds) <- pi_names
+      dplyr::bind_cols(ti[i, c("state", "date", "fold", "obs")],
+                       tibble::as_tibble(as.list(bounds))) %>% dplyr::mutate(model = label)
+    })
+  }
+  cal_display <- dplyr::bind_rows(display_intervals(built_with, "WITH"),
+                                display_intervals(built_without, "WITHOUT"))
+  evaluation <- rows %>% dplyr::filter(state %in% states) %>%
+    dplyr::select(model, dplyr::all_of(plot_columns))
+  fig_data <- dplyr::bind_rows(cal_display, evaluation) %>% dplyr::arrange(model, state, date)
+  stopifnot(nrow(fig_data) == 400L, !anyDuplicated(fig_data[c("model", "state", "date")]),
+            all(dplyr::count(fig_data, model, state)$n == 50L))
+  check_intervals(fig_data)
+
+  summary_check <- rows %>% dplyr::group_by(model) %>%
+    dplyr::summarise(n_targets = dplyr::n(), mean_wis = mean(wis),
+      coverage_50 = mean(obs >= lower_50 & obs <= upper_50),
+      coverage_80 = mean(obs >= lower_80 & obs <= upper_80),
+      coverage_95 = mean(obs >= lower_95 & obs <= upper_95),
+      mean_width_95 = mean(upper_95 - lower_95), .groups = "drop")
+  saved_summary <- saved_summary %>% dplyr::filter(protocol == "ROLLING10")
+  for (label in c("WITH", "WITHOUT")) {
+    a <- summary_check %>% dplyr::filter(model == label)
+    b <- saved_summary %>% dplyr::filter(model == label)
+    cols <- c("mean_wis", "coverage_50", "coverage_80", "coverage_95", "mean_width_95")
+    stopifnot(nrow(a) == 1L, nrow(b) == 1L, a$n_targets == 1840L,
+              all(abs(as.numeric(unlist(a[cols])) - as.numeric(unlist(b[cols]))) <= tolerance))
+  }
+  table_s4_check <- summary_check %>% dplyr::transmute(
+    Model = unname(model_labels[model]), `Mean WIS` = sprintf("%.3f", mean_wis),
+    `50% PI coverage` = sprintf("%.1f%%", 100 * coverage_50),
+    `80% PI coverage` = sprintf("%.1f%%", 100 * coverage_80),
+    `95% PI coverage` = sprintf("%.1f%%", 100 * coverage_95),
+    `Mean 95% PI width` = sprintf("%.2f", mean_width_95))
+
+  plot_data <- fig_data %>% dplyr::mutate(
+    model = factor(unname(model_labels[model]), levels = unname(model_labels)),
+    state = factor(unname(state_labels[state]), levels = unname(state_labels[states])))
+  p <- ggplot2::ggplot(plot_data, ggplot2::aes(x = date)) +
+    ggplot2::annotate("rect", xmin = eval_dates[1] - 3, xmax = eval_dates[10] + 3,
+                      ymin = -Inf, ymax = Inf, fill = "grey70", alpha = 0.3) +
+    ggplot2::geom_ribbon(ggplot2::aes(ymin = lower_95, ymax = upper_95, fill = model), alpha = 0.18) +
+    ggplot2::geom_ribbon(ggplot2::aes(ymin = lower_80, ymax = upper_80, fill = model), alpha = 0.28) +
+    ggplot2::geom_ribbon(ggplot2::aes(ymin = lower_50, ymax = upper_50, fill = model), alpha = 0.40) +
+    ggplot2::geom_line(ggplot2::aes(y = predictive_median, colour = model), linewidth = 0.7) +
+    ggplot2::geom_point(ggplot2::aes(y = obs), colour = "black", size = 0.8) +
+    ggplot2::facet_grid(state ~ model, scales = "free_y") +
+    ggplot2::scale_fill_manual(values = model_fills, guide = "none") +
+    ggplot2::scale_colour_manual(values = model_lines, guide = "none") +
+    ggplot2::scale_x_date(date_breaks = "2 months", date_labels = "%b\n%Y") +
+    ggplot2::labs(x = NULL, y = "Weekly hospital admissions per 100,000 population") +
+    ggplot2::theme_bw(base_size = 10) +
+    ggplot2::theme(panel.grid.minor = ggplot2::element_blank(),
+                   strip.background = ggplot2::element_rect(fill = "grey95"),
+                   strip.text.y = ggplot2::element_text(angle = -90))
+  print(p)
+  if (save_fig) {
+    ggplot2::ggsave(out_pdf, p, width = 8, height = 8.5, bg = "white")
+    ggplot2::ggsave(out_png, p, width = 8, height = 8.5, dpi = 300, bg = "white")
+  }
+  state_summary <- fig_data %>% dplyr::filter(fold != 1L) %>%
+    dplyr::group_by(model, state) %>% dplyr::summarise(
+      n_targets = dplyr::n(), coverage_95 = mean(obs >= lower_95 & obs <= upper_95),
+      mean_width_95 = mean(upper_95 - lower_95), .groups = "drop")
+  invisible(list(plot = p, data = fig_data, table_s4_check = table_s4_check,
+                 state_summary = state_summary, theta_fold1 = theta_fold1))
+}
+
+fig_s7_rolling <- make_fig_s7_rolling(
+  res = res,
+  boot_full = boot_full,
+  boot_full_without = boot_full_without,
+  states = selected_states_final,
+  out_pdf = "FigS7_prediction_intervals.pdf",
+  out_png = "FigS7_prediction_intervals.png"
+)
+```

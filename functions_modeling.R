@@ -346,16 +346,106 @@ modeling_m_stateaware <- function(k, X_train_labeled, X_test_labeled,
   list(y_predicted = y_predicted, error_rmse = error_rmse)
 }
 
+# Forecast-origin training windows
+fold_weeks <- function(i) {
+  if (i == 1L) {
+    list(train = c(1L, 20L), test = c(16L, 30L))
+  } else {
+    base <- 10L * (i - 1L)
+    list(train = c(base - 4L, base + 20L), test = c(base + 16L, base + 30L))
+  }
+}
+
+week_rows <- function(w, n_states) c((w[1] - 1L) * n_states + 1L, w[2] * n_states)
+
+week_dates <- function(dataset) sort(unique(as.Date(dataset$date)))
+
+affected_targets <- function(i, wlag) {
+  fw <- fold_weeks(i)
+  train_end <- fw$train[2]
+  targets <- fw$test[1] + 5L + seq_len(10L) - 1L
+  origins <- targets - wlag
+  targets[origins < train_end]
+}
+
+build_origin_design <- function(dataset, i, wlag, target_week, n_states, exclusion_rules) {
+
+  fw <- fold_weeks(i)
+  origin_week <- target_week - wlag
+  stopifnot(origin_week >= fw$train[1] + 5L)
+
+  tr <- week_rows(c(fw$train[1], origin_week), n_states)
+  te <- week_rows(c(target_week - 5L, target_week), n_states)
+
+  train_data <- dataset[tr[1]:tr[2], , drop = FALSE]
+  test_data  <- dataset[te[1]:te[2], , drop = FALSE]
+
+  X_train_result <- make_Xdata_train(train_data, lag = wlag, ylag = wlag,
+                                     exclusion_rules = exclusion_rules)
+  X_test_data <- make_Xdata_test(test_data, lag = wlag, ylag = wlag,
+                                 bs_objects_from_train = X_train_result$bs_objects,
+                                 exclusion_rules = exclusion_rules)
+
+  X_train_labeled <- make_Xlist_new_labeled(X_train_result$data)
+  X_test_labeled  <- make_Xlist_new_labeled(X_test_data)
+  y_train_labeled <- make_y_labeled(train_data)
+  y_test_labeled  <- make_y_labeled(test_data)
+
+  stopifnot(
+    identical(paste(X_train_labeled$state, X_train_labeled$date),
+              paste(y_train_labeled$state, y_train_labeled$date)),
+    dplyr::n_distinct(y_test_labeled$date) == 1L,
+    max(y_train_labeled$date) <= min(y_test_labeled$date) - 7 * wlag
+  )
+
+  list(X_train = X_train_labeled, X_test = X_test_labeled,
+       y_train = y_train_labeled$obs, target_week = target_week)
+}
+
+fit_combo_on_design <- function(combo, design, exclusion_rules, seed) {
+
+  X_train_combo <- do.call(cbind, lapply(design$X_train$X_list[combo], as.matrix))
+  X_test_combo  <- do.call(cbind, lapply(design$X_test$X_list[combo],  as.matrix))
+  storage.mode(X_train_combo) <- "double"
+  storage.mode(X_test_combo)  <- "double"
+
+  mask_train <- get_exclusion_mask(combo, design$X_train$state, design$X_train$date, exclusion_rules)
+  mask_test  <- get_exclusion_mask(combo, design$X_test$state,  design$X_test$date,  exclusion_rules)
+
+  X_train_f <- X_train_combo[!mask_train, , drop = FALSE]
+  y_train_f <- design$y_train[!mask_train]
+  X_test_f  <- X_test_combo[!mask_test, , drop = FALSE]
+
+  stopifnot(all(is.finite(X_train_f)), all(is.finite(y_train_f)), all(is.finite(X_test_f)))
+
+  set.seed(seed)
+  foldid <- sample(rep(seq_len(10L), length.out = nrow(X_train_f)))
+
+  cv_fit <- glmnet::cv.glmnet(
+    X_train_f, y_train_f, alpha = 1, family = poisson(link = "log"),
+    lambda = 10^seq(3, -2, by = -0.1), foldid = foldid
+  )
+
+  tibble::tibble(
+    state = as.character(design$X_test$state[!mask_test]),
+    date  = as.Date(design$X_test$date[!mask_test]),
+    pred_new = as.numeric(predict(cv_fit, type = "response",
+                                  s = cv_fit$lambda.min, newx = X_test_f))
+  )
+}
+
 # ---------------------------------------------------------
 # Rolling-window cross-validation over five folds.
 # ---------------------------------------------------------
 modeling_20_10_median_stateaware <- function(count, wlag, dataset, n_states,
-                                             exclusion_rules) {
+                                             exclusion_rules, seed_base = 9000L) {
 
   set.seed(237)
 
   d <- 5
-  n_combos <- ncol(combn(12, count))
+  combos <- combn(12, count, simplify = FALSE)
+  n_combos <- length(combos)
+  replaced <- list()
 
   y_predicted_by_fold <- vector("list", d)
   error_vec_rmse <- matrix(nrow = 0, ncol = n_combos)
@@ -423,8 +513,65 @@ modeling_20_10_median_stateaware <- function(count, wlag, dataset, n_states,
       exclusion_rules = exclusion_rules
     )
 
-    y_predicted_by_fold[[i]] <- comb$y_predicted
-    error_vec_rmse <- rbind(error_vec_rmse, comb$error_rmse)
+    fold_preds <- comb$y_predicted
+
+    # Refit targets whose origins precede the fold training cutoff.
+    targets <- affected_targets(i, wlag)
+
+    if (length(targets) > 0L) {
+
+      saved_stream <- .Random.seed
+
+      designs <- lapply(targets, function(tw) {
+        build_origin_design(dataset, i, wlag, tw, n_states, exclusion_rules)
+      })
+
+      for (ci in seq_len(n_combos)) {
+
+        refits <- dplyr::bind_rows(lapply(seq_along(designs), function(dj) {
+          seed <- seed_base + 1000000L * wlag + 100000L * i + 10000L * dj + ci
+          fit_combo_on_design(combos[[ci]], designs[[dj]], exclusion_rules, seed)
+        }))
+
+        old <- fold_preds[[ci]] %>%
+          dplyr::mutate(state = as.character(state), date = as.Date(date))
+
+        old_key <- paste(old$state, old$date)
+        new_key <- paste(refits$state, refits$date)
+        target_dates <- week_dates(dataset)[targets]
+
+        stopifnot(
+          anyDuplicated(old_key) == 0L,
+          anyDuplicated(new_key) == 0L,
+          all(new_key %in% old_key),
+          nrow(refits) == sum(old$date %in% target_dates),
+          setequal(unique(refits$date), target_dates)
+        )
+
+        p <- old %>%
+          dplyr::left_join(refits, by = c("state", "date")) %>%
+          dplyr::mutate(replaced = !is.na(pred_new),
+                        pred = dplyr::if_else(replaced, pred_new, pred)) %>%
+          dplyr::select(-pred_new)
+
+        stopifnot(
+          nrow(p) == nrow(old),
+          sum(p$replaced) == nrow(refits),
+          all(p$replaced == (p$date %in% target_dates)),
+          all(is.finite(p$pred))
+        )
+
+        fold_preds[[ci]] <- p %>% dplyr::select(-replaced)
+      }
+
+      assign(".Random.seed", saved_stream, envir = globalenv())
+
+      replaced[[i]] <- tibble::tibble(fold = i, target_week = targets, origin_week = targets - wlag)
+    }
+
+    fold_rmse <- vapply(fold_preds, function(p) sqrt(mean((p$pred - p$obs)^2)), numeric(1))
+    y_predicted_by_fold[[i]] <- fold_preds
+    error_vec_rmse <- rbind(error_vec_rmse, fold_rmse)
 
     message("k=", count, " | fold=", i, " done")
   }
@@ -435,7 +582,8 @@ modeling_20_10_median_stateaware <- function(count, wlag, dataset, n_states,
 
   list(
     y_predicted_new   = y_predicted_new,
-    error_median_rmse = apply(error_vec_rmse, 2, median)
+    error_median_rmse = apply(error_vec_rmse, 2, median),
+    replaced = dplyr::bind_rows(replaced)
   )
 }
 

@@ -4,6 +4,235 @@ output: html_document
 date: "2026-08-23"
 ---
 
+# Table 2 and Table S2
+
+```{r}
+library(dplyr)
+library(tibble)
+library(glmnet)
+
+COMMON_EXCLUDE_STATES <- c("IA", "MN", "MO", "OK")
+FEATURES_PER_PREDICTOR <- 21L
+LAMBDAS <- 10^seq(3, -2, by = -0.1)
+USE_CACHE <- FALSE
+CACHE_DIR <- "results/predictor_contribution_selected"
+
+source_list <- c(
+  "Wearing Masks", "Symptoms", "Symptoms in Community", "Outpatient Visits",
+  "Test Positivity", "Cases", "Deaths", "Vaccinations",
+  "Policy Index", "Climate", "Hospital Admissions", "ED Visits"
+)
+
+stopifnot(
+  exists("final_data"), exists("predictor_block_exclusions"), exists("selected_models"),
+  exists("make_Xdata_train"), exists("make_Xdata_test"),
+  exists("make_Xlist_new_labeled"), exists("make_y_labeled"), exists("get_exclusion_mask")
+)
+
+SELECTED <- selected_models %>%
+  dplyr::transmute(
+    wlag = horizon,
+    model = ifelse(has_hospitalization, "WITH", "WITHOUT"),
+    k, idx = combo_index
+  )
+
+WEEK_DATES <- sort(unique(as.Date(final_data$date)))
+stopifnot(length(WEEK_DATES) == 70L)
+
+replaced_weeks <- function(wlag) {
+  if (wlag <= 1L) return(integer(0))
+  unlist(lapply(1:5, function(i) 10L * (i - 1L) + 20L + seq_len(wlag - 1L)))
+}
+
+build_fold_inputs <- function(wlag, dataset = final_data, n_states = 50L,
+                              exclusion_rules = predictor_block_exclusions) {
+  folds <- vector("list", 5L)
+  for (i in 1:5) {
+    if (i == 1L) {
+      train_start <- 1L;                                   train_end <- n_states * 20L
+      test_start  <- n_states * 15L + 1L;                  test_end  <- n_states * 30L
+    } else {
+      train_start <- (i - 2L) * (n_states * 10L) + (n_states * 5L + 1L)
+      train_end   <- train_start + (n_states * 25L) - 1L
+      test_start  <- (i - 1L) * (n_states * 10L) + (n_states * 15L + 1L)
+      test_end    <- test_start + (n_states * 15L) - 1L
+    }
+    train_data <- dataset[train_start:train_end, , drop = FALSE]
+    test_data  <- dataset[test_start:test_end, , drop = FALSE]
+
+    X_train_result <- make_Xdata_train(dataset = train_data, lag = wlag, ylag = wlag,
+                                       exclusion_rules = exclusion_rules)
+    X_test_data <- make_Xdata_test(dataset = test_data, lag = wlag, ylag = wlag,
+                                   bs_objects_from_train = X_train_result$bs_objects,
+                                   exclusion_rules = exclusion_rules)
+    X_train_labeled <- make_Xlist_new_labeled(X_train_result$data)
+    X_test_labeled  <- make_Xlist_new_labeled(X_test_data)
+    y_train_labeled <- make_y_labeled(train_data)
+    y_test_labeled  <- make_y_labeled(test_data)
+
+    key <- function(l) paste(as.character(l$state), as.character(as.Date(l$date)))
+    if (!identical(key(X_train_labeled), key(y_train_labeled))) stop("Fold ", i, ": train X-y alignment failure.")
+    if (!identical(key(X_test_labeled),  key(y_test_labeled)))  stop("Fold ", i, ": test X-y alignment failure.")
+
+    folds[[i]] <- list(X_train = X_train_labeled, X_test = X_test_labeled,
+                       y_train = y_train_labeled$obs, y_test = y_test_labeled$obs)
+  }
+  folds
+}
+
+fit_selected_contribution <- function(k, combo_index, wlag, fold_inputs,
+                                      exclusion_rules = predictor_block_exclusions) {
+  comb_indices <- combn(12, k)
+  n_combos <- ncol(comb_indices)
+  stopifnot(combo_index >= 1L, combo_index <= n_combos)
+  selected_predictors <- as.integer(comb_indices[, combo_index])
+
+  pred_by_fold <- contribution_by_fold <- nonzero_by_fold <- coef_by_fold <- vector("list", 5L)
+
+  set.seed(237)
+  for (fold_index in 1:5) {
+    fi <- fold_inputs[[fold_index]]
+    fitted <- FALSE
+    for (i in seq_len(n_combos)) {
+      combo_i <- as.integer(comb_indices[, i])
+      mask_train_i <- get_exclusion_mask(combo_i, fi$X_train$state, fi$X_train$date, exclusion_rules)
+      foldid_i <- sample(rep(seq_len(10L), length.out = sum(!mask_train_i)))
+      if (i != combo_index) next
+
+      X_train_combo <- do.call(cbind, lapply(fi$X_train$X_list[combo_i], as.matrix))
+      X_test_combo  <- do.call(cbind, lapply(fi$X_test$X_list[combo_i],  as.matrix))
+      storage.mode(X_train_combo) <- "double"; storage.mode(X_test_combo) <- "double"
+      stopifnot(ncol(X_train_combo) == k * FEATURES_PER_PREDICTOR,
+                ncol(X_test_combo)  == k * FEATURES_PER_PREDICTOR)
+
+      mask_test_i <- get_exclusion_mask(combo_i, fi$X_test$state, fi$X_test$date, exclusion_rules)
+      X_train_f <- X_train_combo[!mask_train_i, , drop = FALSE]; y_train_f <- fi$y_train[!mask_train_i]
+      X_test_f  <- X_test_combo[!mask_test_i, , drop = FALSE];   y_test_f  <- fi$y_test[!mask_test_i]
+      state_test_f <- as.character(fi$X_test$state[!mask_test_i])
+      date_test_f  <- as.Date(fi$X_test$date[!mask_test_i])
+      stopifnot(all(is.finite(X_train_f)), all(is.finite(y_train_f)),
+                all(is.finite(X_test_f)), all(is.finite(y_test_f)))
+
+      cv_fit <- glmnet::cv.glmnet(X_train_f, y_train_f, alpha = 1, family = poisson(link = "log"),
+                                  lambda = LAMBDAS, standardize = TRUE, foldid = foldid_i)
+      y_pred <- as.numeric(predict(cv_fit, type = "response", s = cv_fit$lambda.min, newx = X_test_f))
+      coef_sparse <- coef(cv_fit, s = cv_fit$lambda.min)
+      beta <- as.numeric(coef_sparse)[-1]
+      stopifnot(length(beta) == k * FEATURES_PER_PREDICTOR)
+
+      common_keep <- !state_test_f %in% COMMON_EXCLUDE_STATES
+      common_counts <- table(state_test_f[common_keep])
+      stopifnot(length(common_counts) == 46L, all(common_counts == 10L))
+
+      contribution_score <- numeric(k); nonzero_count <- integer(k)
+      for (b in seq_len(k)) {
+        cols <- ((b - 1L) * FEATURES_PER_PREDICTOR + 1L):(b * FEATURES_PER_PREDICTOR)
+        eta <- as.numeric(X_test_f[common_keep, cols, drop = FALSE] %*% beta[cols])
+        contribution_score[b] <- sqrt(mean((eta - mean(eta))^2))
+        nonzero_count[b] <- sum(beta[cols] != 0)
+      }
+      names(contribution_score) <- names(nonzero_count) <- as.character(combo_i)
+
+      pred_by_fold[[fold_index]] <- tibble::tibble(state = state_test_f, date = date_test_f,
+                                                   obs = y_test_f, pred = y_pred)
+      contribution_by_fold[[fold_index]] <- contribution_score
+      nonzero_by_fold[[fold_index]] <- nonzero_count
+      coef_by_fold[[fold_index]] <- coef_sparse
+      fitted <- TRUE
+    }
+    if (!fitted) stop("Target combination was not fitted.")
+  }
+
+  list(k = k, combo_index = combo_index, wlag = wlag, predictors = selected_predictors,
+       y_predicted_new = dplyr::bind_rows(pred_by_fold),
+       contribution_by_fold = contribution_by_fold, nonzero_by_fold = nonzero_by_fold,
+       coef_by_fold = coef_by_fold,
+       importance_definition = "Fold-averaged RMS of centred predictor-block contribution to the held-out log mean.")
+}
+
+verify_selected_prediction <- function(result, tolerance = 1e-6) {
+  object_name <- paste0("comb", result$k, "_median_vac.lag", result$wlag)
+  if (!exists(object_name, envir = .GlobalEnv)) stop("Reference object not found: ", object_name)
+  ref <- get(object_name, envir = .GlobalEnv)$y_predicted_new[[result$combo_index]] %>%
+    dplyr::mutate(state = as.character(state), date = as.Date(date)) %>% dplyr::arrange(state, date)
+  new <- result$y_predicted_new %>%
+    dplyr::mutate(state = as.character(state), date = as.Date(date)) %>% dplyr::arrange(state, date)
+  stopifnot(nrow(new) == nrow(ref),
+            identical(paste(new$state, new$date), paste(ref$state, ref$date)),
+            isTRUE(all.equal(new$obs, ref$obs, tolerance = 0)))
+
+  keep <- !(new$date %in% WEEK_DATES[replaced_weeks(result$wlag)])
+  max_diff <- max(abs(new$pred[keep] - ref$pred[keep]))
+  if (max_diff >= tolerance) stop("Prediction reproduction FAILED (max difference = ", max_diff, ").")
+  invisible(max_diff)
+}
+
+summarize_selected_contribution <- function(result) {
+  p <- result$predictors; k <- length(p); n_folds <- length(result$contribution_by_fold)
+  cm <- matrix(NA_real_, n_folds, k, dimnames = list(NULL, as.character(p)))
+  nm <- matrix(NA_integer_, n_folds, k, dimnames = list(NULL, as.character(p)))
+  for (f in seq_len(n_folds)) {
+    cm[f, ] <- result$contribution_by_fold[[f]][as.character(p)]
+    nm[f, ] <- result$nonzero_by_fold[[f]][as.character(p)]
+  }
+  tibble::tibble(
+    predictor_number = p, predictor_name = source_list[p],
+    mean_contribution_rms = colMeans(cm), median_contribution_rms = apply(cm, 2, median),
+    min_contribution_rms = apply(cm, 2, min), max_contribution_rms = apply(cm, 2, max),
+    folds_with_nonzero_features = colSums(nm > 0), mean_number_nonzero_features = colMeans(nm)
+  ) %>%
+    dplyr::arrange(dplyr::desc(mean_contribution_rms), predictor_number) %>%
+    dplyr::mutate(importance_rank = dplyr::row_number()) %>%
+    dplyr::select(importance_rank, dplyr::everything())
+}
+
+fit_or_load_selected <- function(k, idx, wlag, fold_inputs) {
+  path <- file.path(CACHE_DIR, sprintf("contribution_lag%d_k%d_idx%d.rds", wlag, k, idx))
+  if (USE_CACHE && file.exists(path)) {
+    result <- readRDS(path)
+    verify_selected_prediction(result)
+    return(result)
+  }
+  result <- fit_selected_contribution(k = k, combo_index = idx, wlag = wlag, fold_inputs = fold_inputs)
+  verify_selected_prediction(result)
+  if (USE_CACHE) {
+    dir.create(CACHE_DIR, recursive = TRUE, showWarnings = FALSE)
+    saveRDS(result, path)
+  }
+  result
+}
+
+imp_display <- function(x) {
+  x %>% dplyr::mutate(
+    dplyr::across(c(mean_contribution_rms, median_contribution_rms, min_contribution_rms, max_contribution_rms),
+                  ~ sprintf("%.3f", .x)),
+    mean_number_nonzero_features = sprintf("%.1f", mean_number_nonzero_features))
+}
+ordering_line <- function(df, label) {
+  cat(label, ":\n  ", paste(seq_len(nrow(df)), df$predictor_name, sep = ". ", collapse = "  |  "), "\n", sep = "")
+}
+
+importance <- list()
+for (h in 1:3) {
+  fold_inputs <- build_fold_inputs(wlag = h)
+  for (m in c("WITH", "WITHOUT")) {
+    s <- SELECTED %>% dplyr::filter(wlag == h, model == m)
+    stopifnot(nrow(s) == 1L)
+    result <- fit_or_load_selected(k = s$k, idx = s$idx, wlag = h, fold_inputs = fold_inputs)
+    imp <- summarize_selected_contribution(result)
+    importance[[paste0("lag", h, "_", m)]] <- imp
+    print(imp_display(imp), n = Inf, width = Inf)
+  }
+}
+
+ordering_line(importance$lag3_WITH,    "3-week WITH")
+ordering_line(importance$lag3_WITHOUT, "3-week WITHOUT")
+ordering_line(importance$lag1_WITH,    "1-week WITH")
+ordering_line(importance$lag1_WITHOUT, "1-week WITHOUT")
+ordering_line(importance$lag2_WITH,    "2-week WITH")
+ordering_line(importance$lag2_WITHOUT, "2-week WITHOUT")
+```
+
 # Table S1
 
 ```{r}
@@ -258,19 +487,16 @@ library(dplyr)
 library(purrr)
 
 
-NATIONAL_K   <- 6L
-NATIONAL_IDX <- 105L
+national_model <- selected_models %>%
+  dplyr::filter(horizon == 3L, has_hospitalization)
+stopifnot(nrow(national_model) == 1L)
+NATIONAL_K <- national_model$k
+NATIONAL_IDX <- national_model$combo_index
 
 N_STATES_EXPECTED    <- 46L
 N_FORECASTS_EXPECTED <- 50L
 N_CANDIDATES         <- 4095L
-
-stopifnot(
-  identical(
-    as.integer(combn(12, NATIONAL_K, simplify = FALSE)[[NATIONAL_IDX]]),
-    c(1L, 2L, 4L, 5L, 11L, 12L)
-  )
-)
+HI_EXCLUDE_DATE      <- as.Date("2022-02-06")
 
 all_state_rmse <- purrr::map_dfr(1:12, function(k) {
 
@@ -279,8 +505,9 @@ all_state_rmse <- purrr::map_dfr(1:12, function(k) {
 
   purrr::imap_dfr(pred_list, function(pred_tbl, combo_index) {
     pred_tbl %>%
-      dplyr::mutate(state = as.character(state)) %>%
+      dplyr::mutate(state = as.character(state), date = as.Date(date)) %>%
       dplyr::filter(!state %in% COMMON_EXCLUDE_STATES) %>%
+      dplyr::filter(!(state == "HI" & date == HI_EXCLUDE_DATE)) %>%
       dplyr::group_by(state) %>%
       dplyr::summarise(
         rmse = sqrt(mean((pred - obs)^2)),
@@ -295,7 +522,8 @@ stopifnot(
   nrow(dplyr::distinct(all_state_rmse, k, combo_index)) == N_CANDIDATES,
   dplyr::n_distinct(all_state_rmse$state) == N_STATES_EXPECTED,
   all(dplyr::count(all_state_rmse, k, combo_index, name = "n")$n == N_STATES_EXPECTED),
-  all(all_state_rmse$n_forecasts == N_FORECASTS_EXPECTED),
+  all(all_state_rmse$n_forecasts[all_state_rmse$state != "HI"] == N_FORECASTS_EXPECTED),
+  all(all_state_rmse$n_forecasts[all_state_rmse$state == "HI"] == N_FORECASTS_EXPECTED - 1L),
   all(is.finite(all_state_rmse$rmse)),
   all(all_state_rmse$rmse > 0)
 )
@@ -399,179 +627,34 @@ table_s7 <- univariate %>%
   )
 
 print(table_s7, n = Inf)
+
+reduction <- univariate %>%
+  dplyr::inner_join(bivariate, by = "pred") %>%
+  dplyr::mutate(reduction_pct = 100 * (individual - combined) / individual)
+stopifnot(nrow(reduction) == 11L)
+mean_red <- mean(reduction$reduction_pct)
+se_red <- sd(reduction$reduction_pct) / sqrt(nrow(reduction))
+cat(sprintf("Mean reduction: %.1f%% | 95%% CI (normal): %.1f-%.1f%% | 95%% CI (t): %.1f-%.1f%%\n",
+            mean_red, mean_red - 1.96 * se_red, mean_red + 1.96 * se_red,
+            mean_red - qt(0.975, nrow(reduction) - 1) * se_red,
+            mean_red + qt(0.975, nrow(reduction) - 1) * se_red))
+print(reduction %>% dplyr::arrange(dplyr::desc(reduction_pct)) %>%
+        dplyr::mutate(dplyr::across(c(individual, combined, reduction_pct), ~ round(.x, 3))), n = Inf)
+
 ```
 
 # Table S8
 
 ```{r}
-library(dplyr)
-library(purrr)
-
-
-stopifnot(
-  identical(combn(12, 6, simplify = FALSE)[[105]], c(1L, 2L, 4L, 5L, 11L, 12L)),
-  identical(combn(12, 4, simplify = FALSE)[[103]], c(1L, 4L, 8L, 12L))
-)
-
-if (!exists("pred_with_final_46") || !exists("pred_without_final_46")) {
-
-  get_pred_46 <- function(k, idx) {
-    object_name <- paste0("comb", k, "_median_vac.lag3")
-    if (!exists(object_name, envir = .GlobalEnv)) {
-      stop("Object not found: ", object_name)
-    }
-    get(object_name, envir = .GlobalEnv)$y_predicted_new[[idx]] %>%
-      dplyr::transmute(
-        state = as.character(state), date = as.Date(date), obs, pred
-      ) %>%
-      dplyr::filter(!state %in% COMMON_EXCLUDE_STATES)
-  }
-
-  pred_with_final_46    <- get_pred_46(6, 105)
-  pred_without_final_46 <- get_pred_46(4, 103)
-}
-
-pred_compare <- pred_with_final_46 %>%
-  dplyr::transmute(state, date, obs_with = obs, pred_with = pred) %>%
-  dplyr::inner_join(
-    pred_without_final_46 %>%
-      dplyr::transmute(state, date, obs_without = obs, pred_without = pred),
-    by = c("state", "date")
-  )
-
-prediction_count_check <- pred_compare %>%
-  dplyr::count(state, name = "n_predictions")
-
-stopifnot(
-  nrow(pred_compare) == 2300,
-  dplyr::n_distinct(pred_compare$state) == 46,
-  all(prediction_count_check$n_predictions == 50),
-  isTRUE(all.equal(pred_compare$obs_with, pred_compare$obs_without, tolerance = 0)),
-  all(is.finite(pred_compare$obs_with)),
-  all(is.finite(pred_compare$pred_with)),
-  all(is.finite(pred_compare$pred_without))
-)
-
-pred_compare <- pred_compare %>%
-  dplyr::transmute(state, date, obs = obs_with, pred_with, pred_without)
-```
-
-```{r}
-peak_windows <- tibble::tibble(
-  peak  = c("Delta", "Omicron"),
-  start = as.Date(c("2021-07-25", "2021-12-05")),
-  end   = as.Date(c("2021-11-28", "2022-02-27"))
-)
-
-compute_peak_errors <- function(df_state, peak_name, start_date, end_date) {
-
-  d <- df_state %>%
-    dplyr::filter(date >= start_date, date <= end_date) %>%
-    dplyr::arrange(date)
-
-  if (nrow(d) == 0) {
-    stop("No observations in peak window for state ", unique(df_state$state))
-  }
-
-  obs_i     <- which.max(d$obs)
-  with_i    <- which.max(d$pred_with)
-  without_i <- which.max(d$pred_without)
-
-  obs_peak <- d$obs[obs_i]
-  obs_date <- d$date[obs_i]
-
-  if (!is.finite(obs_peak) || obs_peak <= 0) {
-    stop("Observed peak is non-positive or non-finite for state ",
-         unique(d$state), ", peak ", peak_name)
-  }
-
-  tibble::tibble(
-    state = unique(d$state),
-    peak = peak_name,
-
-    obs_peak_date = obs_date,
-    obs_peak_value = obs_peak,
-
-    pred_peak_date_with = d$date[with_i],
-    pred_peak_value_with = d$pred_with[with_i],
-    pred_peak_date_without = d$date[without_i],
-    pred_peak_value_without = d$pred_without[without_i],
-
-    mag_err_with_pct = 100 * (d$pred_with[with_i] - obs_peak) / obs_peak,
-    mag_err_without_pct = 100 * (d$pred_without[without_i] - obs_peak) / obs_peak,
-    timing_err_with_wk = as.numeric(d$date[with_i] - obs_date) / 7,
-    timing_err_without_wk = as.numeric(d$date[without_i] - obs_date) / 7,
-
-    n_obs_peak_ties = sum(d$obs == max(d$obs)),
-    n_with_peak_ties = sum(d$pred_with == max(d$pred_with)),
-    n_without_peak_ties = sum(d$pred_without == max(d$pred_without))
-  )
-}
-
-peak_results <- purrr::map_dfr(sort(unique(pred_compare$state)), function(st) {
-
-  df_state <- pred_compare %>% dplyr::filter(state == st)
-
-  purrr::pmap_dfr(peak_windows, function(peak, start, end) {
-    compute_peak_errors(df_state, peak, start, end)
-  })
-}) %>%
-  dplyr::mutate(
-    abs_mag_with = abs(mag_err_with_pct),
-    abs_mag_without = abs(mag_err_without_pct),
-    abs_tim_with = abs(timing_err_with_wk),
-    abs_tim_without = abs(timing_err_without_wk)
-  )
-
-state_peak_check <- peak_results %>% dplyr::count(state, name = "n_peaks")
-
-stopifnot(
-  nrow(peak_results) == 92,
-  dplyr::n_distinct(peak_results$state) == 46,
-  all(state_peak_check$n_peaks == 2),
-  all(peak_results$obs_peak_value > 0),
-  all(is.finite(peak_results$mag_err_with_pct)),
-  all(is.finite(peak_results$mag_err_without_pct)),
-  all(is.finite(peak_results$timing_err_with_wk)),
-  all(is.finite(peak_results$timing_err_without_wk))
-)
-```
-
-```{r}
-summarise_peak_errors <- function(df) {
-  df %>%
-    dplyr::summarise(
-      med_absmag_with = median(abs_mag_with),
-      q25_absmag_with = quantile(abs_mag_with, 0.25),
-      q75_absmag_with = quantile(abs_mag_with, 0.75),
-      med_absmag_without = median(abs_mag_without),
-      q25_absmag_without = quantile(abs_mag_without, 0.25),
-      q75_absmag_without = quantile(abs_mag_without, 0.75),
-      med_abstim_with = median(abs_tim_with),
-      q25_abstim_with = quantile(abs_tim_with, 0.25),
-      q75_abstim_with = quantile(abs_tim_with, 0.75),
-      med_abstim_without = median(abs_tim_without),
-      q25_abstim_without = quantile(abs_tim_without, 0.25),
-      q75_abstim_without = quantile(abs_tim_without, 0.75),
-      .groups = "drop"
-    )
-}
-
-fmt <- function(med, lo, hi, digits) {
-  sprintf(paste0("%.", digits, "f (%.1f\u2013%.1f)"), med, lo, hi)
-}
-
-table_s8 <- peak_results %>%
-  dplyr::group_by(peak) %>%
-  summarise_peak_errors() %>%
+stopifnot(exists("peak_analysis"), is.data.frame(peak_analysis$table_s8))
+table_s8 <- peak_analysis$table_s8 %>%
   dplyr::transmute(
     Wave = peak,
-    `Amplitude, including` = fmt(med_absmag_with, q25_absmag_with, q75_absmag_with, 1),
-    `Amplitude, excluding` = fmt(med_absmag_without, q25_absmag_without, q75_absmag_without, 1),
-    `Timing, including` = fmt(med_abstim_with, q25_abstim_with, q75_abstim_with, 0),
-    `Timing, excluding` = fmt(med_abstim_without, q25_abstim_without, q75_abstim_without, 0)
+    `Amplitude, including` = amp_with,
+    `Amplitude, excluding` = amp_without,
+    `Timing, including` = tim_with,
+    `Timing, excluding` = tim_without
   )
-
 as.data.frame(table_s8)
 ```
 

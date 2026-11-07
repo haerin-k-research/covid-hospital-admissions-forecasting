@@ -52,7 +52,7 @@ stopifnot(
 
 # Fit all predictor combinations across forecast horizons
 
-```{r}
+```{r, eval = FALSE}
 for (wlag in 1:3) {
    for (k in 1:12) {
      result_k <- run_stateaware_by_k_checked(
@@ -259,4 +259,17 @@ compute_all_median_46 <- function(lag_suffix) {
 all_lag1_46 <- compute_all_median_46("lag1")
 all_lag2_46 <- compute_all_median_46("lag2")
 all_lag3_46 <- compute_all_median_46("lag3")
+```
+
+# Selected models
+
+```{r}
+selected_models <- dplyr::bind_rows(
+  all_lag1_46, all_lag2_46, all_lag3_46
+) %>%
+  dplyr::mutate(horizon = as.integer(sub("lag", "", lag))) %>%
+  dplyr::arrange(horizon, has_hospitalization, median_state_rmse_46, k, combo_index) %>%
+  dplyr::group_by(horizon, has_hospitalization) %>%
+  dplyr::slice(1) %>%
+  dplyr::ungroup()
 ```
